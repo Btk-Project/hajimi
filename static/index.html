@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hajimi Reverse Proxy - 控制台</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --card-border: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #38bdf8;
+      --primary-hover: #0284c7;
+      --success: #10b981;
+      --danger: #ef4444;
+      --danger-hover: #dc2626;
+      --input-bg: #0f172a;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background-color: var(--bg);
+      color: var(--text-main);
+      padding: 24px;
+      line-height: 1.5;
+    }
+    .container { max-width: 1100px; margin: 0 auto; }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--card-border);
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-title { font-size: 22px; font-weight: 700; color: var(--primary); }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(16, 185, 129, 0.15);
+      color: var(--success);
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .status-dot { width: 8px; height: 8px; background: var(--success); border-radius: 50%; }
+    
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .stat-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 16px 20px;
+    }
+    .stat-label { font-size: 13px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 4px; }
+    .stat-val { font-size: 26px; font-weight: 700; color: #fff; }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--card-border);
+      font-size: 16px;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .card-body { padding: 20px; }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)) 120px;
+      gap: 14px;
+      align-items: end;
+    }
+    .form-group label {
+      display: block;
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+    .form-control {
+      width: 100%;
+      background: var(--input-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      color: var(--text-main);
+      font-size: 14px;
+      outline: none;
+    }
+    .form-control:focus { border-color: var(--primary); }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 9px 16px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: all 0.2s;
+    }
+    .btn-primary { background: var(--primary); color: #0f172a; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-danger:hover { background: var(--danger-hover); }
+    .btn-sm { padding: 4px 10px; font-size: 12px; border-radius: 4px; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th {
+      text-align: left;
+      padding: 10px 14px;
+      background: rgba(15, 23, 42, 0.4);
+      color: var(--text-muted);
+      font-weight: 600;
+      border-bottom: 1px solid var(--card-border);
+    }
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid rgba(51, 65, 85, 0.4);
+    }
+    tr:last-child td { border-bottom: none; }
+    .tag {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-family: monospace;
+      background: #334155;
+      color: #38bdf8;
+    }
+    .empty-tip { color: var(--text-muted); text-align: center; padding: 24px; font-size: 14px; }
+
+    #toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #1e293b;
+      border: 1px solid var(--card-border);
+      padding: 12px 20px;
+      border-radius: 6px;
+      box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+      display: none;
+      font-size: 14px;
+      z-index: 999;
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <header>
+    <div class="brand">
+      <span class="brand-title">🐱 Hajimi Proxy</span>
+      <div class="status-badge">
+        <span class="status-dot"></span>
+        <span>运行中</span>
+      </div>
+    </div>
+    <div>
+      <span id="uptime-text" style="font-size: 13px; color: var(--text-muted);">运行时间: 0s</span>
+    </div>
+  </header>
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-label">主控核心端口 (Master)</div>
+      <div class="stat-val" id="stat-master-port">-</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">WebUI 界面端口</div>
+      <div class="stat-val" id="stat-webui-port">-</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">在线客户端 (Clients)</div>
+      <div class="stat-val" id="stat-clients-count">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">活跃转发规则 (Rules)</div>
+      <div class="stat-val" id="stat-rules-count">0</div>
+    </div>
+  </div>
+
+  <!-- 新建反向代理规则卡片 -->
+  <div class="card">
+    <div class="card-header">
+      <span>➕ 新建反向代理规则</span>
+    </div>
+    <div class="card-body">
+      <form id="rule-form" onsubmit="handleCreateRule(event)" class="form-grid">
+        <div class="form-group">
+          <label>服务端监听端口 (Listen Port)</label>
+          <input type="number" id="f-listen-port" class="form-control" placeholder="例: 666" required min="1" max="65535">
+        </div>
+        <div class="form-group">
+          <label>目标客户端 (Target Client)</label>
+          <select id="f-client-name" class="form-control" required>
+            <option value="">-- 选择在线客户端 --</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>客户端内网地址</label>
+          <input type="text" id="f-target-host" class="form-control" value="127.0.0.1" required>
+        </div>
+        <div class="form-group">
+          <label>客户端目标端口 (Target Port)</label>
+          <input type="number" id="f-target-port" class="form-control" placeholder="例: 1145" required min="1" max="65535">
+        </div>
+        <button type="submit" class="btn btn-primary">启动代理</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- 活跃反向代理规则列表 -->
+  <div class="card">
+    <div class="card-header">
+      <span>🌐 活跃端口转发规则</span>
+    </div>
+    <div class="card-body" style="padding: 0;">
+      <table>
+        <thead>
+          <tr>
+            <th>服务端监听端口</th>
+            <th>目标客户端</th>
+            <th>内网目标地址</th>
+            <th>当前并发</th>
+            <th>历史连接数</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="rules-body">
+          <tr><td colspan="6" class="empty-tip">暂无转发规则，请在上方添加</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 在线客户端列表 -->
+  <div class="card">
+    <div class="card-header">
+      <span>💻 在线客户端列表</span>
+    </div>
+    <div class="card-body" style="padding: 0;">
+      <table>
+        <thead>
+          <tr>
+            <th>客户端名称 (Name)</th>
+            <th>远端 IP 地址</th>
+            <th>在线时长</th>
+            <th>快捷操作</th>
+          </tr>
+        </thead>
+        <tbody id="clients-body">
+          <tr><td colspan="4" class="empty-tip">等待客户端连接中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+  let statusCache = { clients: [], rules: [] };
+
+  function showToast(msg, isError = false) {
+    const toast = document.getElementById("toast");
+    toast.textContent = msg;
+    toast.style.borderColor = isError ? "var(--danger)" : "var(--success)";
+    toast.style.display = "block";
+    setTimeout(() => { toast.style.display = "none"; }, 3000);
+  }
+
+  function formatSeconds(sec) {
+    if (sec < 60) return sec + "秒";
+    if (sec < 3600) return Math.floor(sec / 60) + "分 " + (sec % 60) + "秒";
+    return Math.floor(sec / 3600) + "时 " + Math.floor((sec % 3600) / 60) + "分";
+  }
+
+  async function fetchStatus() {
+    try {
+      const res = await fetch("/api/status");
+      if (!res.ok) return;
+      const data = await res.json();
+      statusCache = data;
+      render(data);
+    } catch (e) {
+      console.error("Fetch status error:", e);
+    }
+  }
+
+  function render(data) {
+    document.getElementById("stat-master-port").textContent = (data.master_host || "") + ":" + (data.master_port || "-");
+    document.getElementById("stat-webui-port").textContent = (data.webui_host || "") + ":" + (data.webui_port || "-");
+    document.getElementById("stat-clients-count").textContent = (data.clients || []).length;
+    document.getElementById("stat-rules-count").textContent = (data.rules || []).length;
+    document.getElementById("uptime-text").textContent = "运行时间: " + formatSeconds(data.uptime_seconds || 0);
+
+    // Update Client select options
+    const clientSelect = document.getElementById("f-client-name");
+    const currentVal = clientSelect.value;
+    clientSelect.innerHTML = '<option value="">-- 选择在线客户端 --</option>';
+    (data.clients || []).forEach(c => {
+      const opt = document.createElement("option");
+      opt.value = c.name;
+      opt.textContent = c.name + " (" + c.remote_ip + ")";
+      clientSelect.appendChild(opt);
+    });
+    if (currentVal) clientSelect.value = currentVal;
+
+    // Render Rules Table
+    const rulesBody = document.getElementById("rules-body");
+    if (!data.rules || data.rules.length === 0) {
+      rulesBody.innerHTML = '<tr><td colspan="6" class="empty-tip">暂无转发规则，请在上方添加</td></tr>';
+    } else {
+      rulesBody.innerHTML = data.rules.map(r => `
+        <tr>
+          <td><span class="tag">:${r.listen_port}</span></td>
+          <td><b>${r.client_name}</b></td>
+          <td>${r.target_host}:${r.target_port}</td>
+          <td><span style="color: ${r.active_connections > 0 ? 'var(--success)' : 'inherit'}">${r.active_connections}</span></td>
+          <td>${r.total_connections}</td>
+          <td>
+            <button class="btn btn-danger btn-sm" onclick="handleDeleteRule(${r.listen_port})">停止并移除</button>
+          </td>
+        </tr>
+      `).join("");
+    }
+
+    // Render Clients Table
+    const clientsBody = document.getElementById("clients-body");
+    if (!data.clients || data.clients.length === 0) {
+      clientsBody.innerHTML = '<tr><td colspan="4" class="empty-tip">等待客户端连接中...</td></tr>';
+    } else {
+      clientsBody.innerHTML = data.clients.map(c => `
+        <tr>
+          <td><b>${c.name}</b></td>
+          <td>${c.remote_ip}</td>
+          <td>${formatSeconds(c.uptime_seconds)}</td>
+          <td>
+            <button class="btn btn-primary btn-sm" onclick="quickSelectClient('${c.name}')">选为转发目标</button>
+          </td>
+        </tr>
+      `).join("");
+    }
+  }
+
+  function quickSelectClient(clientName) {
+    const sel = document.getElementById("f-client-name");
+    sel.value = clientName;
+    document.getElementById("f-listen-port").focus();
+  }
+
+  async function handleCreateRule(e) {
+    e.preventDefault();
+    const listenPort = parseInt(document.getElementById("f-listen-port").value);
+    const clientName = document.getElementById("f-client-name").value;
+    const targetHost = document.getElementById("f-target-host").value.trim() || "127.0.0.1";
+    const targetPort = parseInt(document.getElementById("f-target-port").value);
+
+    if (!listenPort || !clientName || !targetPort) {
+      showToast("请填写完整的端口与客户端信息", true);
+      return;
+    }
+
+    try {
+      const res = await fetch("/api/rules", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          listen_port: listenPort,
+          client_name: clientName,
+          target_host: targetHost,
+          target_port: targetPort,
+        }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        showToast(data.message || "规则创建成功！");
+        document.getElementById("f-listen-port").value = "";
+        fetchStatus();
+      } else {
+        showToast("创建失败: " + (data.error || "未知错误"), true);
+      }
+    } catch (err) {
+      showToast("请求失败: " + err, true);
+    }
+  }
+
+  async function handleDeleteRule(port) {
+    if (!confirm(`确定停止并移除端口 :${port} 的转发规则吗？`)) return;
+    try {
+      const res = await fetch("/api/rules", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ listen_port: port }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        showToast(data.message || "规则已移除");
+        fetchStatus();
+      } else {
+        showToast("移除失败: " + (data.error || "未知错误"), true);
+      }
+    } catch (err) {
+      showToast("请求失败: " + err, true);
+    }
+  }
+
+  // Initial fetch and poll every 2 seconds
+  fetchStatus();
+  setInterval(fetchStatus, 2000);
+</script>
+
+</body>
+</html>
+
