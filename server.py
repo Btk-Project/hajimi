@@ -7,6 +7,7 @@ from typing import Dict, Optional, Tuple, Any
 
 from common import send_json, read_json, relay_streams
 from web import WebHandler
+from duckdns import DuckDNSUpdater
 
 logger = logging.getLogger("hajimi")
 
@@ -68,7 +69,16 @@ class ProxyRule:
 class ProxyServer:
     """Master reverse proxy server managing control connections and proxy ports."""
 
-    def __init__(self, host: Optional[str] = "0.0.0.0", port: int = 8000, webui_addr: Optional[str] = None):
+    def __init__(
+        self,
+        host: Optional[str] = "0.0.0.0",
+        port: int = 8000,
+        webui_addr: Optional[str] = None,
+        duckdns_domain: Optional[str] = None,
+        duckdns_token: Optional[str] = None,
+        duckdns_interval: int = 300,
+        duckdns_base_url: str = "https://www.duckdns.org/update",
+    ):
         self.host = host
         self.port = port
         self.webui_addr = webui_addr
@@ -82,6 +92,17 @@ class ProxyServer:
         self.web_handler = WebHandler(self)
         self.start_time = time.time()
 
+        # Initialize DuckDNS updater if configured
+        self.duckdns_updater: Optional[DuckDNSUpdater] = None
+        if duckdns_domain and duckdns_token:
+            self.duckdns_updater = DuckDNSUpdater(
+                domain=duckdns_domain,
+                token=duckdns_token,
+                server_host=host,
+                interval=duckdns_interval,
+                base_url=duckdns_base_url,
+            )
+
     def _format_url(self, host: Optional[str], port: int) -> str:
         """Format an HTTP URL with proper IPv6 bracket handling."""
         display_host = host
@@ -92,7 +113,7 @@ class ProxyServer:
         return f"http://{display_host}:{port}"
 
     async def start(self) -> None:
-        """Start listening on master port and optional dedicated WebUI port."""
+        """Start listening on master port, dedicated WebUI port, and DuckDNS updater."""
         self.master_server = await asyncio.start_server(
             self._handle_master_connection,
             self.host,
@@ -119,8 +140,16 @@ class ProxyServer:
         else:
             logger.info(f"[Server] WebUI available at {self._format_url(self.host, self.port)}")
 
+        # Start DuckDNS updater
+        if self.duckdns_updater:
+            await self.duckdns_updater.start()
+
     async def stop(self) -> None:
-        """Gracefully stop master server, web server, and all proxy rules."""
+        """Gracefully stop master server, web server, duckdns, and all proxy rules."""
+        # Stop DuckDNS updater
+        if self.duckdns_updater:
+            await self.duckdns_updater.stop()
+
         # Stop all proxy rules
         for port in list(self.rules.keys()):
             await self.remove_rule(port)
@@ -352,5 +381,6 @@ class ProxyServer:
             "webui_host": self.webui_host or "*",
             "clients": [c.to_dict() for c in self.clients.values()],
             "rules": [r.to_dict() for r in self.rules.values()],
+            "duckdns": self.duckdns_updater.get_status() if self.duckdns_updater else None,
         }
 

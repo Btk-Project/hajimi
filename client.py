@@ -29,6 +29,10 @@ class ProxyClient:
                 reader, writer = await asyncio.open_connection(self.master_host, self.master_port)
                 self._control_writer = writer
 
+                peer = writer.get_extra_info("peername")
+                peer_desc = f" ({peer[0]}:{peer[1]})" if peer else ""
+                logger.info(f"[Client] Connected to master {self.master_host}:{self.master_port}{peer_desc}")
+
                 # Register client name with master
                 await send_json(writer, {"type": "register", "name": self.client_name})
                 ack = await read_json(reader)

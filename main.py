@@ -16,10 +16,23 @@ logging.basicConfig(
 logger = logging.getLogger("hajimi")
 
 
-async def run_server(listen_addr: str, webui_addr: str = None) -> None:
+async def run_server(
+    listen_addr: str,
+    webui_addr: Optional[str] = None,
+    duckdns_domain: Optional[str] = None,
+    duckdns_token: Optional[str] = None,
+    duckdns_interval: int = 300,
+) -> None:
     """Run master server instance."""
     host, port = parse_address(listen_addr, default_host="0.0.0.0", default_port=8000)
-    server = ProxyServer(host=host, port=port, webui_addr=webui_addr)
+    server = ProxyServer(
+        host=host,
+        port=port,
+        webui_addr=webui_addr,
+        duckdns_domain=duckdns_domain,
+        duckdns_token=duckdns_token,
+        duckdns_interval=duckdns_interval,
+    )
     await server.start()
 
     try:
@@ -62,9 +75,33 @@ def main() -> None:
         help="Optional dedicated WebUI address e.g. '0.0.0.0:9000', '127.0.0.1:8080', or '9000'",
     )
     parser.add_argument(
+        "--duckdns",
+        type=str,
+        default=None,
+        help="DuckDNS configuration in 'domain:token' format (e.g. 'myhome:a7c4d0ad-...')",
+    )
+    parser.add_argument(
+        "--duckdns-domain",
+        type=str,
+        default=None,
+        help="DuckDNS domain/subdomain e.g. 'myhome' or 'myhome.duckdns.org'",
+    )
+    parser.add_argument(
+        "--duckdns-token",
+        type=str,
+        default=None,
+        help="DuckDNS account token (UUID)",
+    )
+    parser.add_argument(
+        "--duckdns-interval",
+        type=int,
+        default=300,
+        help="DuckDNS update interval in seconds (default: 300)",
+    )
+    parser.add_argument(
         "--connect",
         type=str,
-        help="Run as client: master address e.g. '127.0.0.1:8000', '[::1]:8000', or 'master::8000'",
+        help="Run as client: master address e.g. 'myhome.duckdns.org:8000', '127.0.0.1:8000', or '[::1]:8000'",
     )
     parser.add_argument(
         "--name",
@@ -76,8 +113,28 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.listen:
+        # Resolve DuckDNS domain and token
+        dd_domain = args.duckdns_domain
+        dd_token = args.duckdns_token
+        if args.duckdns:
+            val = args.duckdns.strip()
+            if ":" in val:
+                parts = val.split(":", 1)
+                dd_domain = parts[0].strip()
+                dd_token = parts[1].strip()
+            elif "@" in val:
+                parts = val.split("@", 1)
+                dd_token = parts[0].strip()
+                dd_domain = parts[1].strip()
+
         try:
-            asyncio.run(run_server(args.listen, args.webui))
+            asyncio.run(run_server(
+                args.listen,
+                webui_addr=args.webui,
+                duckdns_domain=dd_domain,
+                duckdns_token=dd_token,
+                duckdns_interval=args.duckdns_interval,
+            ))
         except KeyboardInterrupt:
             logger.info("Server exiting on user interrupt.")
     elif args.connect:

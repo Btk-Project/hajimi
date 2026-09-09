@@ -4,6 +4,11 @@
 
 ## 🌟 特性
 - **零第三方依赖 (Zero External Dependencies)**：纯 Python 3.8+ 标准库编写，无需 `pip install` 任何包。
+- **DuckDNS 动态域名自动同步 (DDNS Support)**：
+  - 服务端支持绑定 DuckDNS，定期自动更新公网 IP。
+  - **智能协议匹配**：绑定 IPv4 时仅更新 IPv4 (A 记录)；绑定 IPv6 时自动检测并仅更新 IPv6 (AAAA 记录)；双栈时两者均更新。
+  - Web 控制台实时显示 DuckDNS 同步状态与 IP。
+- **域名连接与解析**：客户端原生支持直接连接域名（如 `xxx.duckdns.org:8000`），内置 DNS 解析与自动重连。
 - **独立/复用 WebUI 自由配置**：
   - 默认单端口多路复用：一个端口同时搞定控制流、桥接通道与 WebUI。
   - 支持 `--webui "ip:port"` 指定独立管理端口，方便分离公网暴露端口与内网管理面板。
@@ -20,32 +25,38 @@
 
 ### 1. 启动服务端 (Server)
 
-**模式 A：单端口复用（WebUI 与主服务共用 8000 端口）**
+**模式 A：单端口复用**
 ```bash
 python main.py --listen "0.0.0.0:8000"
 # WebUI 直接访问: http://127.0.0.1:8000
 ```
 
-**模式 B：独立 WebUI 端口（主服务 8000，WebUI 独立在 9000）**
+**模式 B：启用 DuckDNS 动态域名自动更新**
+```bash
+# 绑定 IPv4 时更新 IPv4:
+python main.py --listen "0.0.0.0:8000" --duckdns "myhome:a7c4d0ad-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# 绑定 IPv6 时更新 IPv6:
+python main.py --listen "[::]:8000" --duckdns-domain "myhome" --duckdns-token "a7c4d0ad-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+**模式 C：独立 WebUI 端口**
 ```bash
 python main.py --listen "0.0.0.0:8000" --webui "0.0.0.0:9000"
 # WebUI 访问: http://127.0.0.1:9000
 ```
 
-**模式 C：IPv6 监听**
-```bash
-python main.py --listen "[::]:8000" --webui "[::]:9000"
-```
-
 ### 2. 启动内网客户端 (Client)
-在需要被访问的内网机器上运行：
+客户端支持连接到 IP 或 DuckDNS 域名：
 ```bash
-python main.py --connect "master_ip:8000" --name "mypc"
+# 连接到 DuckDNS 域名:
+python main.py --connect "myhome.duckdns.org:8000" --name "mypc"
 
-# IPv6 示例:
+# 连接到 IP (IPv4 或 IPv6):
+python main.py --connect "1.2.3.4:8000" --name "mypc"
 python main.py --connect "[2001:db8::1]:8000" --name "mypc"
 ```
-> 注：支持 `master:port`、`master::port` 与 `[ipv6]:port` 等多种写法，客户端名称支持引号包裹。
+> 注：支持 `domain:port`、`domain::port` 与 `[ipv6]:port` 等多种写法，客户端名称支持引号包裹。
 
 ### 3. 配置反向代理转发
 在服务端 Web 控制台界面：

@@ -25,6 +25,9 @@ def parse_address(addr_str: str, default_host: Optional[str] = None, default_por
         return default_host, default_port
 
     s = addr_str.strip().strip("'\"")
+    # Strip URL scheme and trailing slashes if present
+    s = re.sub(r"^https?://", "", s, flags=re.IGNORECASE)
+    s = s.rstrip("/")
 
     # 1. Bracketed IPv6 notation: [host]:port or [host]
     bracket_match = re.match(r"^\[([a-fA-F0-9:]+)\](?:::|:)?(\d+)?$", s)
