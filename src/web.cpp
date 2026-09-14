@@ -1,4 +1,3 @@
-#include <nlohmann/json.hpp>
 #include <ilias/macros.hpp>
 #include <ilias/task.hpp>
 #include <ilias/net.hpp>
@@ -7,11 +6,10 @@
 #include <string>
 #include <format>
 #include <print>
+#include "server.hpp"
 #include "web.hpp"
 
 // Import types
-using nlohmann::json;
-
 using ilias::TcpListener;
 using ilias::TcpStream;
 using ilias::BufStream;
@@ -25,13 +23,13 @@ extern "C" {
 }
 
 // Impl
-WebUi::WebUi() {
+WebUi::WebUi(ProxyServer &server, IPEndpoint endpoint) : mServer(server), mEndpoint(endpoint) {
 
 }
 
-auto WebUi::run(IPEndpoint endpoint) -> IoTask<void> {
-    std::println("[WebUi] listen on {}", endpoint);
-    ILIAS_CO_TRY(auto listener, co_await TcpListener::bind(endpoint));
+auto WebUi::run() -> IoTask<void> {
+    ILIAS_CO_TRY(auto listener, co_await TcpListener::bind(mEndpoint));
+    std::println("[WebUi] listen on {}", listener.localEndpoint().value());
     
     // Handle incoming connection
     co_await TaskScope::enter([&](auto &scope) -> Task<void> {
@@ -126,6 +124,11 @@ auto WebUi::dispatch(Stream &stream, std::string_view method, std::string_view p
             _binary_index_html_end
         };
         co_return co_await reply(200, "OK", html, "text/html; charset=utf-8");
+    }
+    // Status
+    if (path == "/api/status" && method == "GET") {
+        auto status = mServer.status();
+        co_return co_await reply(200, "OK", status, "application/json; charset=utf-8");
     }
     co_return co_await reply(404, "Not Found", "404 Not Found", "text/plain");
 }

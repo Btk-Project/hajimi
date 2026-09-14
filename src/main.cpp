@@ -1,7 +1,10 @@
 #include <argparse/argparse.hpp>
 #include <ilias/platform.hpp>
+#include <ilias/signal.hpp>
+#include <ilias/task.hpp>
 #include <iostream>
-#include "web.hpp"
+#include "server.hpp"
+#include "client.hpp"
 
 int ilias_main(int argc, char **argv) try {
     argparse::ArgumentParser parser{"hajimi"};
@@ -41,9 +44,37 @@ int ilias_main(int argc, char **argv) try {
 
     // Is server ?
     if (auto listen = parser.present("--listen"); listen) {
+        auto webui = parser.present("--webui").value_or("127.0.0.1:0"); // Choose a random port
+
+        ProxyServer server {
+            ProxyServer::Config {
+                .listen = IPEndpoint::fromString(listen.value()).value(),
+                .webui = IPEndpoint::fromString(webui).value()
+            }
+        };
+        auto [err, ctrlC] = co_await ilias::whenAny(
+            server.run(),
+            ilias::signal::ctrlC()
+        );
+        if (err && !*err) {
+            std::println("[App] Server failed to start => {}", (*err).error().message());
+        }
+        if (ctrlC) {
+            std::println("[App] Ctrl-C");
+        }
         co_return 0;
     }
     else if (auto connect = parser.present("--connect"); connect) {
+        ProxyClient client {
+            ProxyClient::Config {
+                .master = connect.value(),
+                .name = parser.present("--name").value_or("hajimi-client")
+            }
+        };
+        auto _ = co_await ilias::whenAny(
+            client.run(),
+            ilias::signal::ctrlC()
+        );
         co_return 0;
     }
     else {
