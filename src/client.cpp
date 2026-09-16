@@ -15,16 +15,18 @@
 #include "utils.hpp"
 #include <cstring>
 
+// Import types
 using ilias::Buffer;
 using ilias::TaskScope;
 using ilias::Task;
 
+// Take an shortcut, send an vector :)
+using BytesVector = std::pmr::vector<std::byte>;
+
 // Internal state of the client
 class ClientState {
 public:
-    struct Tunnel {
-        ilias::Event mClosed{}; // Set to cancel the whole tunnel
-    };
+    using Tunnel = ilias::mpsc::Sender<BytesVector>; // Send data to the tunnel
 
     // ServerInfo
     std::string mMaster;
@@ -41,10 +43,10 @@ public:
     Mutex mWriteMutex;
 
     // Channel for the closed id
-    ilias::mpsc::Sender<uint64_t> mSender;
+    ilias::mpsc::Sender<uint64_t> mClosedTunnelIds;
 
     // Tunnel
-    std::map<uint64_t, Tunnel *> mTunnels;
+    std::map<uint64_t, Tunnel> mTunnels;
 
     // Workers
     auto readWorker() -> IoTask<void>;
@@ -97,8 +99,12 @@ auto ProxyClient::connectOnce(bool &registered) -> IoTask<void> {
         .name = mConfig.name,
     }));
     ILIAS_CO_TRY(auto msg, co_await readMessage(stream, readBuffer));
+    if (msg.type() == MessageType::FatalError) {
+        std::println("[ProxyClient] Master rejected the registration, Fatal error from master: {}", msg.cast<FatalError>().value().msg);
+        co_return {};
+    }
     if (msg.type() != MessageType::HelloAck) {
-        std::println("[ProxyClient] Master rejected the registration.");
+        std::println("[ProxyClient] Invalid message from master");
         co_return {};
     }
     registered = true;
@@ -116,7 +122,7 @@ auto ProxyClient::connectOnce(bool &registered) -> IoTask<void> {
             .mStream = stream,
             .mReadBuffer = readBuffer,
             .mWriteBuffer = writeBuffer,
-            .mSender = sender,
+            .mClosedTunnelIds = sender,
         };
 
         // Do it
@@ -148,11 +154,23 @@ auto ClientState::readWorker() -> IoTask<void> {
             case MessageType::TunnelClose: { // The tunnel was closed
                 ILIAS_CO_TRY(auto close, msg.cast<TunnelClose>());
                 auto it = mTunnels.find(close.token);
-                if (it != mTunnels.end()) {
-                    auto [_, tunnel] = *it;
-                    tunnel->mClosed.set(); //< Noify it quiting!!!
-                    mTunnels.erase(it); //< Unregister it
+                if (it == mTunnels.end()) {
+                    continue;
                 }
+                mTunnels.erase(it); //< Unregister it, close the sender
+                continue;
+            }
+            case MessageType::DataExchange: { // The tunnel has data
+                ILIAS_CO_TRY(auto exchange, msg.cast<DataExchange>());
+                auto it = mTunnels.find(exchange.token);
+                if (it == mTunnels.end()) {
+                    continue;
+                }
+                auto [token, tunnel] = *it;
+                // Copy the buffer into vector
+                BytesVector vec{};
+                vec.assign(exchange.data.begin(), exchange.data.end());
+                auto _ = co_await tunnel.send(std::move(vec));
                 continue;
             }
             default: {
@@ -165,23 +183,54 @@ auto ClientState::readWorker() -> IoTask<void> {
 
 auto ClientState::tunnelWorker(uint64_t token, std::string host) -> IoTask<void> {
     std::println("[ProxyClient] OpenTunnel '{}' => {}", token, host);
-
+    
     // Prepare state
-    Tunnel tunnel {
+    auto [sender, receiver] = ilias::mpsc::channel<BytesVector>();
+    mTunnels.emplace(token, std::move(sender));
 
-    };
-    mTunnels.emplace(token, &tunnel);
+    // Prepare cleanup
     ScopeExit exit{[&]() {
         auto it = mTunnels.find(token);
         if (it == mTunnels.end()) { // Handled for peer send the TunnelClose
             return;
         }
-        auto _ = mSender.trySend(token); // Send peer an TunnelClose
+        auto _ = mClosedTunnelIds.trySend(token); // Send peer an TunnelClose
     }};
 
     ILIAS_CO_TRY(auto info, co_await ilias::AddressInfo::lookup(host));
     ILIAS_CO_TRY(auto stream, co_await happy_eyeballs::connect(info.endpoints()));
+
     // Got stream, begin copy
+    auto readCopyWorker = [&]() -> IoTask<void> {
+        std::byte storage[4096]; //<  Take short cut now
+        std::span buffer{storage};
+        while (true) {
+            ILIAS_CO_TRY(auto n, co_await stream.read(buffer));
+            if (n == 0) { // EOF, Close!
+                break;
+            }
+            // Send to master
+            auto lock = co_await mWriteMutex.lock();
+            ILIAS_CO_TRYV(co_await writeMessage(mStream, mWriteBuffer, DataExchange {
+                .token = token,
+                .data = buffer.subspan(0, n)
+            }));
+        }
+        co_return {};
+    };
+    auto writeCopyWorker = [&]() -> IoTask<void> {
+        while (auto bytes = co_await receiver.recv()) {
+            // Send bytes to local stream
+            ILIAS_CO_TRYV(co_await stream.writeAll(*bytes));
+        }
+        std::println("[ProxyServer] Tunnel '{}' => {} request to closed by master", token, host);
+        // Peer closed?
+        co_return {};
+    };
+    auto _ = co_await ilias::whenAny(
+        readCopyWorker(),
+        writeCopyWorker()
+    );
     co_return {};
 }
 

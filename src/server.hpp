@@ -13,9 +13,11 @@ using ilias::IPEndpoint;
 using ilias::TcpStream;
 using ilias::BufStream;
 using ilias::IoTask;
+using ilias::Result;
 
 // Forward
 class ClientSession;
+class ProxyRule;
 
 /**
  * @brief The Proxy server 
@@ -38,6 +40,7 @@ public:
      */
     auto run() -> IoTask<void>;
 
+    // Must call in durling the run
     /**
      * @brief Get the status, in json format
      * 
@@ -45,13 +48,27 @@ public:
      */
     auto status() const -> std::string;
 
-    // Must call in run
+    /**
+     * @brief Add an rule
+     * 
+     * @param json The json string of the request
+     * @return Result<void, std::string> 
+     */
+    auto addRule(std::string_view json) -> Result<void, std::string>;
+
+    /**
+     * @brief Remove an rule
+     * 
+     * @param json The json string of the request
+     * @return Result<void, std::string> 
+     */
+    auto removeRule(std::string_view json) -> Result<void, std::string>;
 private:
     auto handleSession(TcpStream stream) -> IoTask<void>;
-    auto handleRule() -> IoTask<void>;
 
     Config mConfig;
     ilias::TaskScope *mScope = nullptr;
     std::chrono::steady_clock::time_point mStartTime; // timestamp of inited
     std::map<std::string, ClientSession *> mSessions; // name -> session
+    std::map<std::uint16_t, ProxyRule *>   mRules; // The rules of proxy [port: rule]
 };

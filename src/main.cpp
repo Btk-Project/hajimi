@@ -13,10 +13,10 @@ int ilias_main(int argc, char **argv) try {
 
     // Server options
     parser.add_argument("--listen")
-        .help("Run as server: listen address e.g. '0.0.0.0:8000', '[::]:8000', or '8000'");
+        .help("Run as server: listen address e.g. '0.0.0.0:8000', '[::]:8000'");
 
     parser.add_argument("--webui")
-        .help("Optional dedicated WebUI address e.g. '0.0.0.0:9000', '127.0.0.1:8080', or '9000'");
+        .help("Optional dedicated WebUI address e.g. '0.0.0.0:9000', '127.0.0.1:8080'");
 
     parser.add_argument("--duckdns")
         .help("DuckDNS configuration in 'domain:token' format (e.g. 'myhome:a7c4d0ad-...')");
@@ -60,7 +60,7 @@ int ilias_main(int argc, char **argv) try {
             std::println("[App] Server failed to start => {}", (*err).error().message());
         }
         if (ctrlC) {
-            std::println("[App] Ctrl-C");
+            std::println("[App] Ctrl-C, Quiting");
         }
         co_return 0;
     }

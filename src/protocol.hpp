@@ -12,10 +12,16 @@
 #include <bit>
 
 // MARK: Protocol
-// Current used version
+// Current used version (increase it of the protocol changes)
 #define HAJIMI_VERSION (uint16_t{0x1})
+
+// The header size 
 #define HAJIMI_HEADER (sizeof(uint16_t) + sizeof(uint8_t))
+
+// The max size of the message
 #define HAJIMI_STORAGE_SIZE (UINT16_MAX + HAJIMI_HEADER)
+
+// The max size of the payload on data exchange message
 #define HAJIMI_MAX_DATA_EXCHANGE (UINT16_MAX - sizeof(uint64_t))
 
 using WriteBuffer = std::array<std::byte, HAJIMI_STORAGE_SIZE>;

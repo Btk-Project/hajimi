@@ -31,7 +31,7 @@ private:
     using Stream = BufStream<TcpStream>;
     
     auto handleIncoming(Stream stream) -> IoTask<void>;
-    auto dispatch(Stream &stream, std::string_view method, std::string_view path) -> IoTask<void>;
+    auto dispatch(Stream &stream, std::string_view method, std::string_view path, std::string_view content) -> IoTask<void>;
 
     ProxyServer &mServer;
     IPEndpoint   mEndpoint;
