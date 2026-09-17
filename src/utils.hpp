@@ -6,6 +6,9 @@
 #include <vector>
 #include <print>
 
+// Bytes vector...
+using BytesVector = std::pmr::vector<std::byte>;
+
 // ScopeExit
 template <typename Fn>
 class ScopeExit {
@@ -28,7 +31,9 @@ inline auto connect(std::vector<ilias::IPEndpoint> endpoints) -> ilias::IoTask<i
     endpoints.erase(newEnd, endpoints.end());
 
     auto lastError = std::make_error_code(std::errc::host_unreachable);
+#if __cpp_lib_format_ranges
     std::println("[HE2] Connect {}", endpoints);
+#endif // __cpp_lib_format_ranges
     if (endpoints.empty()) {
         co_return Err(lastError);
     }

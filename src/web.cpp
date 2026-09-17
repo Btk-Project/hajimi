@@ -136,7 +136,7 @@ auto WebUi::dispatch(Stream &stream, std::string_view method, std::string_view p
     using namespace std::chrono;
     using nlohmann::json;
 
-    std::println("[WebUi] {}:{}, contentLength: {}", method, path, content.size());
+    // std::println("[WebUi] {}:{}, contentLength: {}", method, path, content.size());
 
     // Serve WebUI HTML
     if (path == "/" || path == "/index.html") {

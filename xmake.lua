@@ -21,3 +21,7 @@ target("hajimi")
     -- For static resource
     add_rules("utils.bin2obj", {extensions = ".html"})
     add_files("static/index.html")
+
+    if is_mode("release") then
+        add_rules("c++.unity_build")
+    end

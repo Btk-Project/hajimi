@@ -51,21 +51,12 @@ struct Ping {};
 struct Pong {};
 
 // OpenTunnel from server
+// The tunnel is logical exist before the TunnelClose message
 // u64   token
 // u8 [] host:port
 struct OpenTunnel {
     uint64_t token;
-    std::string host;
-};
-
-// OpenTunnel result from the client
-// u64 token
-// u32 size
-// u8  ok
-struct OpenTunnelAck {
-    uint64_t token;
-    uint32_t size; //< Initialize window size
-    uint8_t  ok;
+    std::string endpoint;
 };
 
 // DataExchange between client <-> server
@@ -103,7 +94,6 @@ enum class MessageType : uint8_t {
     Ping          = 3, // Both, heartbeat ping
     Pong          = 4, // Both, heartbeat ack
     OpenTunnel    = 5, // Server -> Client, Try Open a tunnel
-    OpenTunnelAck = 6, // Client -> Server, 
     DataExchange  = 7, // Both, tunnel data
     TunnelClose   = 8, // Both, tunnel closed
     WindowUpdate  = 9, // Both, tunnel send window update
@@ -123,7 +113,6 @@ public:
         Ping,
         Pong,
         OpenTunnel,
-        OpenTunnelAck,
         DataExchange,
         TunnelClose,
         FatalError
@@ -154,7 +143,6 @@ public:
             [](const Ping &) { return MessageType::Ping; },
             [](const Pong &) { return MessageType::Pong; },
             [](const OpenTunnel &) { return MessageType::OpenTunnel; },
-            [](const OpenTunnelAck &) { return MessageType::OpenTunnelAck; },
             [](const DataExchange &) { return MessageType::DataExchange; },
             [](const TunnelClose &) { return MessageType::TunnelClose; },
             [](const WindowUpdate &) { return MessageType::WindowUpdate; },
@@ -206,14 +194,14 @@ inline auto readMessage(T &stream, ilias::MutableBuffer storage) -> ilias::IoTas
             co_return Message { Pong{} };
         }
         case MessageType::OpenTunnel: {
-            std::string host;
+            std::string endpoint;
             ILIAS_CO_TRY(auto token, co_await reader.readUint64BE());
-            ILIAS_CO_TRYV(co_await reader.readToEnd(host));
-            std::println("[Protocol] OpenTunnel {} => {}", token, host);
+            ILIAS_CO_TRYV(co_await reader.readToEnd(endpoint));
+            std::println("[Protocol] OpenTunnel {} => {}", token, endpoint);
             co_return Message {
                 OpenTunnel {
                     .token = token,
-                    .host = std::move(host)
+                    .endpoint = std::move(endpoint)
                 }
             };
         }
@@ -223,6 +211,17 @@ inline auto readMessage(T &stream, ilias::MutableBuffer storage) -> ilias::IoTas
             co_return Message {
                 TunnelClose {
                     .token = token,
+                }
+            };
+        }
+        case MessageType::DataExchange: {
+            ILIAS_CO_TRY(auto token, co_await reader.readUint64BE());
+            auto data = span.subspan(sizeof(token)); // Skip the token
+            std::println("[Protocol] DataExchange {}, {} bytes", token, data.size());
+            co_return Message {
+                DataExchange {
+                    .token = token,
+                    .data = data,
                 }
             };
         }
@@ -276,15 +275,14 @@ inline auto writeMessage(T &stream, ilias::MutableBuffer storage, Message msg) -
         case MessageType::OpenTunnel: {
             auto tunnel = msg.cast<OpenTunnel>().value();
             appendInt(tunnel.token);
-            appendBytes(ilias::makeBuffer(tunnel.host));
+            appendBytes(ilias::makeBuffer(tunnel.endpoint));
             break;
         }
 
-        case MessageType::OpenTunnelAck: {
-            auto ack = msg.cast<OpenTunnelAck>().value();
-            appendInt(ack.token);
-            appendInt(ack.size);
-            appendInt(ack.ok);
+        case MessageType::DataExchange: {
+            auto exchange = msg.cast<DataExchange>().value();
+            appendInt(exchange.token);
+            appendBytes(exchange.data);
             break;
         }
 

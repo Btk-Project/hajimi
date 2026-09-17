@@ -20,19 +20,17 @@ using ilias::Buffer;
 using ilias::TaskScope;
 using ilias::Task;
 
-// Take an shortcut, send an vector :)
-using BytesVector = std::pmr::vector<std::byte>;
-
 // Internal state of the client
 class ClientState {
 public:
-    using Tunnel = ilias::mpsc::Sender<BytesVector>; // Send data to the tunnel
+    // Take an shortcut, send an vector :)
+    using Tunnel = ilias::mpsc::Sender<BytesVector>;
 
     // ServerInfo
     std::string mMaster;
 
     // Scope
-    TaskScope &mScope;
+    TaskScope *mScope = nullptr;
 
     // Stream
     StreamView mStream;
@@ -50,7 +48,7 @@ public:
 
     // Workers
     auto readWorker() -> IoTask<void>;
-    auto tunnelWorker(uint64_t token, std::string host) -> IoTask<void>;
+    auto tunnelWorker(uint64_t token, std::string endpoint, ilias::mpsc::Receiver<BytesVector> receiver) -> IoTask<void>;
     auto tunnelGCWorker(ilias::mpsc::Receiver<uint64_t> receiver) -> IoTask<void>; // Collect the id of the closed channel, send it to peer
 };
 
@@ -111,21 +109,18 @@ auto ProxyClient::connectOnce(bool &registered) -> IoTask<void> {
     std::println("[ProxyClient] Registered as '{}'", mConfig.name);
 
     // Begin the loop
+    // Prepare channel
+    auto [sender, receiver] = ilias::mpsc::channel<uint64_t>(); // Unbounded
+    ClientState state {
+        .mMaster = mConfig.master,
+        .mStream = stream,
+        .mReadBuffer = readBuffer,
+        .mWriteBuffer = writeBuffer,
+        .mClosedTunnelIds = sender,
+    };
     co_return co_await TaskScope::enter([&](auto &scope) -> IoTask<void> {
-        // Prepare channel
-        auto [sender, receiver] = ilias::mpsc::channel<uint64_t>(); // Unbounded
-
         // If any error, we stop the whole scope
-        ClientState state {
-            .mMaster = mConfig.master,
-            .mScope = scope,
-            .mStream = stream,
-            .mReadBuffer = readBuffer,
-            .mWriteBuffer = writeBuffer,
-            .mClosedTunnelIds = sender,
-        };
-
-        // Do it
+        state.mScope = &scope;
         auto _ = co_await ilias::whenAny(
             state.readWorker(),
             state.tunnelGCWorker(std::move(receiver))
@@ -148,7 +143,10 @@ auto ClientState::readWorker() -> IoTask<void> {
             }
             case MessageType::OpenTunnel: { // Request to open tunnel
                 ILIAS_CO_TRY(auto tunnel, msg.cast<OpenTunnel>());
-                mScope.spawn(tunnelWorker(tunnel.token, tunnel.host)); // Add to dynmaic scope
+                // Synchronously create and register channel before next message can arrive
+                auto [sender, receiver] = ilias::mpsc::channel<BytesVector>();
+                mTunnels.emplace(tunnel.token, std::move(sender));
+                mScope->spawn(tunnelWorker(tunnel.token, tunnel.endpoint, std::move(receiver)));
                 continue;
             }
             case MessageType::TunnelClose: { // The tunnel was closed
@@ -164,6 +162,7 @@ auto ClientState::readWorker() -> IoTask<void> {
                 ILIAS_CO_TRY(auto exchange, msg.cast<DataExchange>());
                 auto it = mTunnels.find(exchange.token);
                 if (it == mTunnels.end()) {
+                    std::println("[ProxyClient] DataExchange for Tunnel '{}' not found", exchange.token);
                     continue;
                 }
                 auto [token, tunnel] = *it;
@@ -181,34 +180,32 @@ auto ClientState::readWorker() -> IoTask<void> {
     }
 }
 
-auto ClientState::tunnelWorker(uint64_t token, std::string host) -> IoTask<void> {
-    std::println("[ProxyClient] OpenTunnel '{}' => {}", token, host);
+auto ClientState::tunnelWorker(uint64_t token, std::string endpoint, ilias::mpsc::Receiver<BytesVector> receiver) -> IoTask<void> {
+    std::println("[ProxyClient] OpenTunnel '{}' => {}", token, endpoint);
     
-    // Prepare state
-    auto [sender, receiver] = ilias::mpsc::channel<BytesVector>();
-    mTunnels.emplace(token, std::move(sender));
-
     // Prepare cleanup
-    ScopeExit exit{[&]() {
+    ScopeExit exit{[&, this]() {
         auto it = mTunnels.find(token);
         if (it == mTunnels.end()) { // Handled for peer send the TunnelClose
             return;
         }
+        mTunnels.erase(it);
         auto _ = mClosedTunnelIds.trySend(token); // Send peer an TunnelClose
     }};
 
-    ILIAS_CO_TRY(auto info, co_await ilias::AddressInfo::lookup(host));
-    ILIAS_CO_TRY(auto stream, co_await happy_eyeballs::connect(info.endpoints()));
+    ILIAS_CO_TRY(auto info, co_await ilias::AddressInfo::lookup(endpoint));
+    ILIAS_CO_TRY(auto local, co_await happy_eyeballs::connect(info.endpoints()));
 
     // Got stream, begin copy
     auto readCopyWorker = [&]() -> IoTask<void> {
         std::byte storage[4096]; //<  Take short cut now
         std::span buffer{storage};
         while (true) {
-            ILIAS_CO_TRY(auto n, co_await stream.read(buffer));
+            ILIAS_CO_TRY(auto n, co_await local.read(buffer));
             if (n == 0) { // EOF, Close!
                 break;
             }
+            std::println("[ProxyServer] Tunnel '{}' read {} bytes data from local", token, n);
             // Send to master
             auto lock = co_await mWriteMutex.lock();
             ILIAS_CO_TRYV(co_await writeMessage(mStream, mWriteBuffer, DataExchange {
@@ -221,9 +218,10 @@ auto ClientState::tunnelWorker(uint64_t token, std::string host) -> IoTask<void>
     auto writeCopyWorker = [&]() -> IoTask<void> {
         while (auto bytes = co_await receiver.recv()) {
             // Send bytes to local stream
-            ILIAS_CO_TRYV(co_await stream.writeAll(*bytes));
+            std::println("[ClientState] Tunnel '{}' write {} bytes data to local", token, bytes->size());
+            ILIAS_CO_TRYV(co_await local.writeAll(*bytes));
         }
-        std::println("[ProxyServer] Tunnel '{}' => {} request to closed by master", token, host);
+        std::println("[ClientState] Tunnel '{}' => {} request to closed by master", token, endpoint);
         // Peer closed?
         co_return {};
     };
