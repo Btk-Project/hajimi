@@ -4,7 +4,6 @@
 #include <ilias/net.hpp>
 #include <ilias/io.hpp>
 #include <string>
-#include <memory>
 #include <chrono>
 #include <map>
 

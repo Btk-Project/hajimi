@@ -3,6 +3,7 @@
 #include <ilias/signal.hpp>
 #include <ilias/task.hpp>
 #include <iostream>
+#include <print>
 #include "server.hpp"
 #include "client.hpp"
 
@@ -78,11 +79,11 @@ int ilias_main(int argc, char **argv) try {
         co_return 0;
     }
     else {
-        std::cerr << parser;
+        std::cerr << parser << std::endl;
         co_return 0;
     }
 }
 catch (std::exception &e) {
-    std::cerr << e.what();
+    std::cerr << e.what() << std::endl;
     co_return 0;
 }

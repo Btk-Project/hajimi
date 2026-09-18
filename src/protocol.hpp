@@ -13,7 +13,7 @@
 
 // MARK: Protocol
 // Current used version (increase it of the protocol changes)
-#define HAJIMI_VERSION (uint16_t{0x1})
+#define HAJIMI_VERSION (uint16_t{0x2})
 
 // The header size 
 #define HAJIMI_HEADER (sizeof(uint16_t) + sizeof(uint8_t))
@@ -24,6 +24,9 @@
 // The max size of the payload on data exchange message
 #define HAJIMI_MAX_DATA_EXCHANGE (UINT16_MAX - sizeof(uint64_t))
 
+// The init window size of the stream
+#define HAJIMI_INIT_WINDOW_SIZE (1024 * 128)
+
 using WriteBuffer = std::array<std::byte, HAJIMI_STORAGE_SIZE>;
 using ReadBuffer = std::array<std::byte, HAJIMI_STORAGE_SIZE>;
 
@@ -33,7 +36,7 @@ using ReadBuffer = std::array<std::byte, HAJIMI_STORAGE_SIZE>;
 // u8 [] payload (whole Hello or DataExchange...)
 //
 // All messages (control and tunnel data) are multiplexed on the same
-// TCP connection, every tunnel data frame is tagged with a u64 token.
+// TCP connection, every tunnel data frame is tagged with a u64 streamId.
 
 // Hello from client
 // u16   version
@@ -52,33 +55,33 @@ struct Pong {};
 
 // OpenTunnel from server
 // The tunnel is logical exist before the TunnelClose message
-// u64   token
+// u64   streamId
 // u8 [] host:port
 struct OpenTunnel {
-    uint64_t token;
+    uint64_t streamId;
     std::string endpoint;
 };
 
 // DataExchange between client <-> server
-// u64   token
+// u64   streamId
 // u8 [] data
 struct DataExchange {
-    uint64_t token;
+    uint64_t streamId;
     ilias::Buffer data; // View into the message storage (size <= HAJIMI_MAX_DATA_EXCHANGE)
 };
 
 // WindowUpdate between client <-> server
-// u64 token
+// u64 streamId
 // u32 size
 struct WindowUpdate {
-    uint64_t token;
+    uint64_t streamId;
     uint32_t size; //< Incerase the sending window
 };
 
 // TunnelClose between client <-> server, the tunnel is gone (idempotent)
-// u64   token
+// u64   streamId
 struct TunnelClose {
-    uint64_t token;
+    uint64_t streamId;
 };
 
 // FatalError between client <-> server, if received, the connection is gone
@@ -115,6 +118,7 @@ public:
         OpenTunnel,
         DataExchange,
         TunnelClose,
+        WindowUpdate,
         FatalError
     >;
 
@@ -155,9 +159,8 @@ private:
 
 // MARK: Deserilize
 // Read the header and payload into the storage, return the Message
-template <ilias::Readable T>
-inline auto readMessage(T &stream, ilias::MutableBuffer storage) -> ilias::IoTask<Message> {
-    assert(storage.size_bytes() >= UINT16_MAX && "Ensure the storage is bigger than the max payload size");
+inline auto readMessage(ilias::ReadableView stream, ilias::MutableBuffer storage) -> ilias::IoTask<Message> {
+    assert(storage.size_bytes() >= HAJIMI_STORAGE_SIZE && "Ensure the storage is bigger than the max payload size");
     // TODO: Optomize the io calls
     ILIAS_CO_TRY(auto len, co_await stream.readUint16BE());
     ILIAS_CO_TRY(auto type, co_await stream.readUint8());
@@ -173,7 +176,7 @@ inline auto readMessage(T &stream, ilias::MutableBuffer storage) -> ilias::IoTas
             ILIAS_CO_TRY(auto version, co_await reader.readUint16BE());
             ILIAS_CO_TRYV(co_await reader.readToEnd(name));
 
-            std::println("[Protocol] Hello: {}, {}", version, name);
+            // std::println("[Protocol] Hello: {}, {}", version, name);
             co_return Message {
                 Hello {
                     .version = version,
@@ -181,54 +184,73 @@ inline auto readMessage(T &stream, ilias::MutableBuffer storage) -> ilias::IoTas
                 }
             };
         }
+
         case MessageType::HelloAck: {
-            std::println("[Protocol] HelloAck");
+            // std::println("[Protocol] HelloAck");
             co_return Message { HelloAck{} };
         }
+
         case MessageType::Ping: {
-            std::println("[Protocol] Ping");
+            // std::println("[Protocol] Ping");
             co_return Message { Ping{} };
         }
+
         case MessageType::Pong: {
-            std::println("[Protocol] Pong");
+            // std::println("[Protocol] Pong");
             co_return Message { Pong{} };
         }
+
         case MessageType::OpenTunnel: {
             std::string endpoint;
-            ILIAS_CO_TRY(auto token, co_await reader.readUint64BE());
+            ILIAS_CO_TRY(auto streamId, co_await reader.readUint64BE());
             ILIAS_CO_TRYV(co_await reader.readToEnd(endpoint));
-            std::println("[Protocol] OpenTunnel {} => {}", token, endpoint);
+            // std::println("[Protocol] OpenTunnel {} => {}", streamId, endpoint);
             co_return Message {
                 OpenTunnel {
-                    .token = token,
+                    .streamId = streamId,
                     .endpoint = std::move(endpoint)
                 }
             };
         }
+
         case MessageType::TunnelClose: {
-            ILIAS_CO_TRY(auto token, co_await reader.readUint64BE());
-            std::println("[Protocol] TunnelClose {}", token);
+            ILIAS_CO_TRY(auto streamId, co_await reader.readUint64BE());
+            // std::println("[Protocol] TunnelClose {}", streamId);
             co_return Message {
                 TunnelClose {
-                    .token = token,
+                    .streamId = streamId,
                 }
             };
         }
+
         case MessageType::DataExchange: {
-            ILIAS_CO_TRY(auto token, co_await reader.readUint64BE());
-            auto data = span.subspan(sizeof(token)); // Skip the token
-            std::println("[Protocol] DataExchange {}, {} bytes", token, data.size());
+            ILIAS_CO_TRY(auto streamId, co_await reader.readUint64BE());
+            auto data = span.subspan(sizeof(streamId)); // Skip the streamId
+            // std::println("[Protocol] DataExchange {}, {} bytes", streamId, data.size());
             co_return Message {
                 DataExchange {
-                    .token = token,
+                    .streamId = streamId,
                     .data = data,
                 }
             };
         }
+
+        case MessageType::WindowUpdate: {
+            ILIAS_CO_TRY(auto streamId, co_await reader.readUint64BE());
+            ILIAS_CO_TRY(auto size, co_await reader.readUint32BE());
+            // std::println("[Protocol] WindowUpdate {}, {} bytes", streamId, size);
+            co_return Message {
+                WindowUpdate {
+                    .streamId = streamId,
+                    .size = size
+                }
+            };
+        }
+
         case MessageType::FatalError: {
             std::string msg;
             ILIAS_CO_TRYV(co_await reader.readToEnd(msg));
-            std::println("[Protocol] FatalError {}", msg);
+            // std::println("[Protocol] FatalError {}", msg);
             co_return Message {
                 FatalError {
                     .msg = std::move(msg)
@@ -243,9 +265,8 @@ inline auto readMessage(T &stream, ilias::MutableBuffer storage) -> ilias::IoTas
 }
 
 // MARK: Serilize
-template <ilias::Writable T>
-inline auto writeMessage(T &stream, ilias::MutableBuffer storage, Message msg) -> ilias::IoTask<void> {
-    assert(storage.size_bytes() >= UINT16_MAX + HAJIMI_HEADER && "Ensure the storage is bigger than the max payload size + header");
+inline auto writeMessage(ilias::WritableView stream, ilias::MutableBuffer storage, Message msg) -> ilias::IoTask<void> {
+    assert(storage.size_bytes() >= HAJIMI_STORAGE_SIZE && "Ensure the storage is bigger than the max payload size + header");
     // The number of bytes of the message
     std::byte *end = storage.data() + HAJIMI_HEADER;
     uint16_t len = 0;
@@ -274,21 +295,28 @@ inline auto writeMessage(T &stream, ilias::MutableBuffer storage, Message msg) -
 
         case MessageType::OpenTunnel: {
             auto tunnel = msg.cast<OpenTunnel>().value();
-            appendInt(tunnel.token);
+            appendInt(tunnel.streamId);
             appendBytes(ilias::makeBuffer(tunnel.endpoint));
             break;
         }
 
         case MessageType::DataExchange: {
             auto exchange = msg.cast<DataExchange>().value();
-            appendInt(exchange.token);
+            appendInt(exchange.streamId);
             appendBytes(exchange.data);
             break;
         }
 
         case MessageType::TunnelClose: {
             auto close = msg.cast<TunnelClose>().value();
-            appendInt(close.token);
+            appendInt(close.streamId);
+            break;
+        }
+
+        case MessageType::WindowUpdate: {
+            auto update = msg.cast<WindowUpdate>().value();
+            appendInt(update.streamId);
+            appendInt(update.size);
             break;
         }
 

@@ -4,14 +4,7 @@
 #include <ilias/task.hpp>
 #include <ilias/net.hpp>
 #include <ilias/io.hpp>
-
-#include <cstdint>
 #include <string>
-#include <vector>
-#include <memory>
-#include <map>
-
-#include "protocol.hpp"
 
 // Import
 using ilias::IPEndpoint;
