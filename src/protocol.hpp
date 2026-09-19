@@ -30,6 +30,9 @@
 using WriteBuffer = std::array<std::byte, HAJIMI_STORAGE_SIZE>;
 using ReadBuffer = std::array<std::byte, HAJIMI_STORAGE_SIZE>;
 
+// Bytes vector...
+using BytesVector = std::pmr::vector<std::byte>;
+
 // Each message is packed by
 // u16   size (payload length)
 // u8    type
@@ -67,7 +70,7 @@ struct OpenTunnel {
 // u8 [] data
 struct DataExchange {
     uint64_t streamId;
-    ilias::Buffer data; // View into the message storage (size <= HAJIMI_MAX_DATA_EXCHANGE)
+    BytesVector data; // The message of the data
 };
 
 // WindowUpdate between client <-> server
@@ -133,7 +136,7 @@ public:
     template <typename T>
     auto cast() -> ilias::IoResult<T> {
         if (std::holds_alternative<T>(mStorage)) {
-            return std::get<T>(mStorage);
+            return std::get<T>(std::move(mStorage));
         }
         // Doesn't expected
         return ilias::Err(std::make_error_code(std::errc::bad_message));
@@ -153,6 +156,9 @@ public:
             [](const FatalError &) { return MessageType::FatalError; },
         }, mStorage);
     }
+
+    // Operator
+    auto operator =(Message &&) -> Message & = default;
 private:
     Storage mStorage;
 };
@@ -230,7 +236,7 @@ inline auto readMessage(ilias::ReadableView stream, ilias::MutableBuffer storage
             co_return Message {
                 DataExchange {
                     .streamId = streamId,
-                    .data = data,
+                    .data = BytesVector{data.begin(), data.end()},
                 }
             };
         }

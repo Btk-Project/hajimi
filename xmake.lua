@@ -3,7 +3,7 @@ set_languages("c++23")
 set_encodings("utf-8")
 
 -- Update
-add_rules("plugin.compile_commands.autoupdate", {outputdir = "build"})
+add_rules("plugin.compile_commands.autoupdate", {outputdir = "build", lsp = "clangd"})
 
 -- Import async runtime
 add_repositories("btk-repo https://github.com/Btk-Project/xmake-repo.git")

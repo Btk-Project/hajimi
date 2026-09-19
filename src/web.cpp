@@ -129,7 +129,6 @@ auto WebUi::dispatch(Stream &stream, std::string_view method, std::string_view p
         if (!content.empty()) {
             ILIAS_CO_TRYV(co_await stream.writeAll(ilias::makeBuffer(content)));
         }
-        ILIAS_CO_TRYV(co_await stream.writeString("\r\n")); // End 
         co_return {};
     };
 

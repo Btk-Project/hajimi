@@ -23,7 +23,7 @@ public:
     auto run() -> Task<void>;
 private:
     auto updateOnce() -> IoTask<void>;
-    auto probeIPV6() -> IoResult<IPAddress>;
+    auto probeIPV6() -> IoTask<IPAddress>;
 
     std::string mDomain;
     std::string mToken;

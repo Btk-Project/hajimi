@@ -3,9 +3,14 @@
 #include <ilias/task.hpp>
 #include <ilias/net.hpp>
 #include <ilias/io.hpp>
+
+#include <optional>
 #include <string>
 #include <chrono>
+#include <memory>
 #include <map>
+
+#include "duckdns.hpp"
 
 // Import
 using ilias::IPEndpoint;
@@ -73,7 +78,7 @@ private:
     Config mConfig;
     ilias::TaskScope *mScope = nullptr;
     std::chrono::steady_clock::time_point mStartTime; // timestamp of inited
-    std::map<std::string, ClientSession *> mSessions; // name -> session
-    std::map<std::uint16_t, ProxyRule *>   mRules; // The rules of proxy [port: rule]
+    std::map<std::string, std::shared_ptr<ClientSession> > mSessions; // name -> session
+    std::map<std::uint16_t, std::shared_ptr<ProxyRule> >   mRules; // The rules of proxy [port: rule]
 friend class ProxyRule;
 };
