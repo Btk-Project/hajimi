@@ -2,8 +2,10 @@
 #include <ilias/platform.hpp>
 #include <ilias/signal.hpp>
 #include <ilias/task.hpp>
-#include <iostream>
+
+#include <sstream>
 #include <print>
+
 #include "server.hpp"
 #include "client.hpp"
 
@@ -47,10 +49,27 @@ int ilias_main(int argc, char **argv) try {
     if (auto listen = parser.present("--listen"); listen) {
         auto webui = parser.present("--webui").value_or("127.0.0.1:0"); // Choose a random port
 
+        // Parse it
+        auto duckdnsDomain = parser.present("--duckdns-domain").value_or("");
+        auto duckdnsToken = parser.present("--duckdns-token").value_or("");
+        if (auto duckdns = parser.present("--duckdns"); duckdns) {
+            auto pos = duckdns->find(":");
+            if (pos == std::string::npos) {
+                throw std::runtime_error{"Bad string in --duckdns, did you missing :?"};
+            }
+            duckdnsDomain = duckdns->substr(0, pos);
+            duckdnsToken = duckdns->substr(pos + 1);
+        }
+
         ProxyServer server {
             ProxyServer::Config {
-                .listen = IPEndpoint::fromString(listen.value()).value(),
-                .webui = IPEndpoint::fromString(webui).value()
+                .listen = IPEndpoint::fromString(*listen).value(),
+                .webui = IPEndpoint::fromString(webui).value(),
+
+                // DuckDns
+                .duckdnsDomain = duckdnsDomain,
+                .duckdnsToken = duckdnsToken,
+                .duckdnsInterval = parser.get<int>("--duckdns-interval"),
             }
         };
         auto [err, ctrlC] = co_await ilias::whenAny(
@@ -79,11 +98,13 @@ int ilias_main(int argc, char **argv) try {
         co_return 0;
     }
     else {
-        std::cerr << parser << std::endl;
+        std::stringstream ss;
+        ss << parser;
+        std::println("{}", ss.str());
         co_return 0;
     }
 }
 catch (std::exception &e) {
-    std::cerr << e.what() << std::endl;
+    std::println(stderr, "{}", e.what());
     co_return 0;
 }

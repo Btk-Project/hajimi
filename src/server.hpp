@@ -27,6 +27,11 @@ public:
     struct Config {
         IPEndpoint listen; // Bind on which address
         IPEndpoint webui; // The webui address
+        
+        // DuckDns
+        std::string duckdnsDomain;
+        std::string duckdnsToken;
+        int duckdnsInterval = 300;
     };
 
     ProxyServer(Config config);

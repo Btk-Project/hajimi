@@ -9,6 +9,7 @@
 #include <print>
 
 #include "protocol.hpp"
+#include "duckdns.hpp"
 #include "server.hpp"
 #include "utils.hpp"
 #include "web.hpp"
@@ -115,11 +116,22 @@ auto ProxyServer::run() -> IoTask<void> {
         .bind(mConfig.listen)
     );
     mStartTime = std::chrono::steady_clock::now();
-    WebUi ui{*this, mConfig.webui}; // Make an webui
+
+    // Make duckdns
+    std::optional<DuckDnsUpdater> duckdns;
+    if (!mConfig.duckdnsDomain.empty()) {
+        duckdns.emplace(mConfig.duckdnsDomain, mConfig.duckdnsToken, mConfig.duckdnsInterval);
+    }
+
+    // Make an webui
+    WebUi ui{*this, mConfig.webui};
 
     // Handle incoming connection
     auto main = TaskScope::enter([&](auto &scope) -> Task<void> {
         mScope = &scope;
+        if (duckdns) {
+            scope.spawn(duckdns->run());
+        }
         while (true) {
             auto incoming = co_await listener.accept();
             if (!incoming) {

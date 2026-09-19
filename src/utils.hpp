@@ -2,6 +2,7 @@
 
 #include <ilias/task.hpp>
 #include <ilias/net.hpp>
+#include <ilias/io.hpp>
 #include <algorithm>
 #include <vector>
 #include <print>
@@ -30,57 +31,32 @@ inline auto connect(std::vector<ilias::IPEndpoint> endpoints) -> ilias::IoTask<i
     auto newEnd = std::unique(endpoints.begin(), endpoints.end());
     endpoints.erase(newEnd, endpoints.end());
 
-    auto lastError = std::make_error_code(std::errc::host_unreachable);
 #if __cpp_lib_format_ranges
     std::println("[HE2] Connect {}", endpoints);
 #endif // __cpp_lib_format_ranges
+
     if (endpoints.empty()) {
-        co_return Err(lastError);
+        co_return Err(std::make_error_code(std::errc::host_unreachable));
     }
 
-    TaskGroup<IoResult<TcpStream>> group{};
-    size_t nextIdx = 0;
-    size_t inFlight = 0;
-
-    // Add one
-    std::println("[HE2] Try connect {}, {} left", endpoints[nextIdx], endpoints.size() - 1);
-    group.spawn(TcpStream::connect(endpoints[nextIdx++]));
-    ++inFlight;
-
-    while (inFlight > 0) {
-        if (nextIdx < endpoints.size()) {
-            // Has more
-            auto tryWait = co_await ilias::timeout(group.next(), 250ms);
-
-            if (tryWait) {
-                --inFlight;
-                auto &conn = tryWait->value(); // We didn't cancel, just unwrap
-                if (conn) {
-                    // Ok
-                    co_return std::move(*conn);
-                }
-
-                // Save it, try more
-                lastError = conn.error();
-            }
-            // Add more
-            std::println("[HE2] Try connect {}, {} left", endpoints[nextIdx], endpoints.size() - nextIdx - 1);
-            group.spawn(TcpStream::connect(endpoints[nextIdx++]));
-            ++inFlight;
-        }
-        else {
-            // All submit
-            auto conn = (co_await group.next()).value(); // We didn't cancel, just unwrap
-            --inFlight;
-
-            if (conn) {
-                co_return std::move(*conn);
-            }
-            lastError = conn.error();
-        }
+    // TODO: Impl real HE2.0
+    TaskGroup<IoResult<TcpStream> > group;
+    for (auto &endpoint : endpoints) {
+        group.spawn(TcpStream::connect(endpoint));
     }
 
-    // All failed
-    co_return Err(lastError);}
+    std::error_code errc;
+    while (!group.empty()) {
+        auto res = (co_await group.next()).value(); // We are not cancel, just call .value()
+        if (res) {
+            std::println("[HE2] Connect OK");
+            co_return std::move(*res);
+        }
+        errc = res.error();
+    }
+    // All failed;
+    std::println("[HE2] Connect all failed {}", errc.message());
+    co_return ilias::Err(errc);
+}
 
 } // happy_eyeballs

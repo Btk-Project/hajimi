@@ -49,7 +49,7 @@ auto WebUi::run() -> IoTask<void> {
 
 auto WebUi::handleIncoming(Stream stream) -> IoTask<void> {
     // Accept each http request and respond
-    // GET PATH HTTP1.1
+    // GET PATH HTTP/1.1
     // HEADER
     // \r\n
     bool keepAlive = true;
