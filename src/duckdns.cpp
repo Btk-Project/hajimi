@@ -35,11 +35,12 @@ auto DuckDnsUpdater::run() -> Task<void> {
 }
 
 auto DuckDnsUpdater::probeIPV6() -> IoResult<IPAddress> {
-    ILIAS_TRY(auto info, ilias::AddressInfo::fromHostnameBlocking("", "80"));
+    ILIAS_TRY(auto info, ilias::AddressInfo::fromHostnameBlocking({}, "80"));
     for (auto endpoint : info.endpoints()) {
         if (endpoint.family() != AF_INET6) {
             continue;
         }
+        std::println("[DuckDns] Found v6 {}", endpoint);
         auto addr6 = endpoint.address6();
         if ((addr6.s6_addr[0] & 0xE0) == 0x20) { // Global
             return addr6;

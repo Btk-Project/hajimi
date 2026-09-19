@@ -190,6 +190,18 @@ auto ClientState::readWorker() -> IoTask<void> {
                 auto _ = co_await tunnel->bytesSender.send(std::move(vec));
                 continue;
             }
+            case MessageType::WindowUpdate: {
+                ILIAS_CO_TRY(auto update, msg.cast<WindowUpdate>());
+                auto it = mTunnels.find(update.streamId);
+                if (it == mTunnels.end()) {
+                    std::println("[ProxyClient] WindowUpdate for Tunnel '{}' not found", update.streamId);
+                    continue;
+                }
+                auto [streamId, tunnel] = *it;
+                tunnel->sendWindow += update.size;
+                tunnel->sendWindowUpdated.set();
+                continue;
+            }
             default: {
                 std::println("[ProxyClient] Unexpected type from {}, disconnect", mMaster);
                 co_return {};
