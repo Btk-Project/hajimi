@@ -6,6 +6,7 @@
 #include <ilias/io.hpp>
 
 #include <memory_resource>
+#include <atomic>
 #include <print>
 
 #include "protocol.hpp"
@@ -78,6 +79,16 @@ public:
     IPEndpoint  mRemoteEndpoint;
     std::chrono::steady_clock::time_point mConnectedAt;
 
+    // Traffic statistics
+    std::size_t mUploadBytes = 0;   // Client -> Server
+    std::size_t mDownloadBytes = 0; // Server -> Client
+    std::size_t mUploadRate = 0;    // Bytes/sec
+    std::size_t mDownloadRate = 0;  // Bytes/sec
+
+    // Latency
+    std::int32_t mLatencyMs = -1;
+    std::chrono::steady_clock::time_point mLastPingSent;
+
     // For posting message to write worker
     ilias::mpsc::Sender<Message> mMessageSender;
 
@@ -85,14 +96,15 @@ public:
     Event mPongArrive {Event::AutoClear};
 
     // Tunnels
-    uint64_t    mStreamId = 0; // Self increase
-    std::map<uint64_t, Tunnel::Ptr> mTunnels;
+    std::uint64_t mStreamId = 0; // Self increase
+    std::map<std::uint64_t, Tunnel::Ptr> mTunnels;
 
     // Pool
     std::pmr::unsynchronized_pool_resource mPool;
 
     // Sub worker
     auto pingWorker() -> IoTask<void>;
+    auto rateWorker() -> IoTask<void>;
     auto readWorker(ReadableView, ReadBuffer &buf) -> IoTask<void>;
     auto writeWorker(WritableView, WriteBuffer &buf, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void>;
     auto tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::string host, uint16_t port) -> IoTask<void>;
@@ -139,7 +151,7 @@ auto ProxyServer::run() -> IoTask<void> {
                 continue;
             }
             auto &[sock, addr] = *incoming;
-            // auto _ = sock.setOption(ilias::sockopt::TcpNoDelay{true});
+            auto _ = sock.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
             scope.spawn(handleSession(std::move(sock)));
         }
     });
@@ -202,7 +214,8 @@ auto ProxyServer::handleSession(TcpStream stream) -> IoTask<void> {
         auto _ = co_await ilias::whenAny(
             session->readWorker(stream, *readBuffer),
             session->writeWorker(stream, *writeBuffer, std::move(receiver)),
-            session->pingWorker()
+            session->pingWorker(),
+            session->rateWorker()
         );
         co_return {};
     });
@@ -217,17 +230,18 @@ auto ProxyServer::status() const -> std::string {
     auto uptime = duration_cast<seconds>(steady_clock::now() - mStartTime);
 
     // clients
-    // "name": self.name,
-    // "remote_ip": f"{self.remote_addr[0]}:{self.remote_addr[1]}",
-    // "connected_at": int(self.connected_at),
-    // "uptime_seconds": int(time.time() - self.connected_at),
     auto clients = json::array();
     for (const auto &[name, client] : mSessions) {
         clients.push_back(json {
             {"name", name},
             {"remote_ip", client->mRemoteEndpoint.toString()},
             {"connected_at", 0}, // TODO:
-            {"uptime_seconds", duration_cast<seconds>(steady_clock::now() - client->mConnectedAt).count()}
+            {"uptime_seconds", duration_cast<seconds>(steady_clock::now() - client->mConnectedAt).count()},
+            {"ping_ms", client->mLatencyMs},
+            {"upload_speed", client->mUploadRate},
+            {"download_speed", client->mDownloadRate},
+            {"upload_total", client->mUploadBytes},
+            {"download_total", client->mDownloadBytes}
         });
     }
 
@@ -348,7 +362,9 @@ auto ClientSession::readWorker(ReadableView stream, ReadBuffer &readBuffer) -> I
         ILIAS_CO_TRY(auto msg, co_await readMessage(stream, readBuffer));
         switch (msg.type()) {
             case MessageType::Pong: {
-                std::println("[ProxyServer] Get pong from '{}'", mName);
+                auto now = std::chrono::steady_clock::now();
+                auto rtt = std::chrono::duration_cast<std::chrono::milliseconds>(now - mLastPingSent).count();
+                mLatencyMs = rtt;
                 mPongArrive.set();
                 continue;
             }
@@ -364,6 +380,8 @@ auto ClientSession::readWorker(ReadableView stream, ReadBuffer &readBuffer) -> I
                     continue;
                 }
                 auto [streamId, tunnel] = *it;
+                // Count uploaded bytes from client
+                mUploadBytes += exchange.data.size();
                 // Copy the buffer into vector
                 auto _ = co_await tunnel->bytesSender.send(std::move(exchange.data));
                 continue;
@@ -416,17 +434,39 @@ auto ClientSession::writeWorker(WritableView stream, WriteBuffer &writeBuffer, i
 auto ClientSession::pingWorker() -> IoTask<void> {
     using namespace std::chrono_literals;
     while (true) {
-        co_await ilias::sleep(30s);
-
-        // Send ping
-        std::println("[ProxyServer] Send ping to '{}'", mName);
+        // Send ping and measure latency
+        mLastPingSent = std::chrono::steady_clock::now();
         auto _ = mMessageSender.trySend(Ping{});
-        auto pong = co_await ilias::timeout(mPongArrive.wait(), 30s);
+        auto pong = co_await ilias::timeout(mPongArrive.wait(), 10s);
         if (!pong) {
             std::println("[ProxyServer] Client '{}' pong timeout, disconnect", mName);
             co_return {};
         }
+        co_await ilias::sleep(30s);
     }
+}
+
+auto ClientSession::rateWorker() -> IoTask<void> {
+    // Refresh the Traffic statistics
+    using namespace std::chrono_literals;
+    auto lastTime = std::chrono::steady_clock::now();
+    auto lastUp = mUploadBytes;
+    auto lastDown = mDownloadBytes;
+    while (true) {
+        co_await ilias::sleep(1s);
+        auto now = std::chrono::steady_clock::now();
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTime).count();
+        if (elapsedMs > 0) {
+            auto curUp = mUploadBytes;
+            auto curDown = mDownloadBytes;
+            mUploadRate = ((curUp - lastUp) * 1000 / elapsedMs);
+            mDownloadRate = ((curDown - lastDown) * 1000 / elapsedMs);
+            lastUp = curUp;
+            lastDown = curDown;
+            lastTime = now;
+        }
+    }
+    co_return {};
 }
 
 auto ClientSession::tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::string host, uint16_t port) -> IoTask<void> {
@@ -486,6 +526,8 @@ auto ClientSession::tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::
                 .streamId = streamId,
                 .data = BytesVector{buffer.begin(), buffer.end()}
             });
+            // Count downloaded bytes for client
+            mDownloadBytes += n;
             tunnel->sendWindow -= n;
         }
         co_return {};
@@ -538,7 +580,7 @@ auto ProxyRule::run() -> IoTask<void> {
                 continue;
             }
             auto &[sock, addr] = *incoming;
-            // auto _ = sock.setOption(ilias::sockopt::TcpNoDelay{true});
+            (void) sock.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
             std::println("[ProxyRule] {}, new connection from {}", mEndpoint, addr);
 
             // Try find the client

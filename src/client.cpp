@@ -91,6 +91,7 @@ auto ProxyClient::connectOnce(bool &registered) -> IoTask<void> {
     // Resolve the master address, it may be a domain name (re-resolve on each reconnect)
     ILIAS_CO_TRY(auto info, co_await ilias::AddressInfo::lookup(mConfig.master));
     ILIAS_CO_TRY(auto stream, co_await happy_eyeballs::connect(info.endpoints()));
+    (void) stream.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
 
     // Do handshake
     auto writeBuffer = std::make_unique<WriteBuffer>();
@@ -222,6 +223,7 @@ auto ClientState::tunnelWorker(uint64_t streamId, std::string endpoint, Tunnel::
 
     ILIAS_CO_TRY(auto info, co_await ilias::AddressInfo::lookup(endpoint));
     ILIAS_CO_TRY(auto local, co_await happy_eyeballs::connect(info.endpoints()));
+    (void) local.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
 
     // Got stream, begin copy
     auto readCopyWorker = [&]() -> IoTask<void> {
