@@ -3,6 +3,8 @@
 // Wire protocol for Hajimi
 #include <ilias/buffer.hpp>
 #include <ilias/io.hpp>
+
+#include <memory_resource>
 #include <cassert>
 #include <cstdint>
 #include <string>
@@ -10,6 +12,8 @@
 #include <array>
 #include <span>
 #include <bit>
+
+#include "common.hpp"
 
 // MARK: Protocol
 // Current used version (increase it of the protocol changes)
@@ -26,9 +30,6 @@
 
 // The init window size of the stream
 #define HAJIMI_INIT_WINDOW_SIZE (1024 * 128)
-
-using WriteBuffer = std::array<std::byte, HAJIMI_STORAGE_SIZE>;
-using ReadBuffer = std::array<std::byte, HAJIMI_STORAGE_SIZE>;
 
 // Bytes vector...
 using BytesVector = std::pmr::vector<std::byte>;
@@ -125,7 +126,7 @@ public:
         FatalError
     >;
 
-    Message(const Message &) = default;
+    Message(const Message &) = delete;
     Message(Message &&) = default;
 
     // Construct inner
@@ -164,15 +165,29 @@ private:
 };
 
 // MARK: Deserilize
-// Read the header and payload into the storage, return the Message
-inline auto readMessage(ilias::ReadableView stream, ilias::MutableBuffer storage) -> ilias::IoTask<Message> {
-    assert(storage.size_bytes() >= HAJIMI_STORAGE_SIZE && "Ensure the storage is bigger than the max payload size");
+class MessageReader {
+public:
+    MessageReader(ilias::ReadableView stream, std::pmr::memory_resource *pool) : mStream(stream), mPool(pool), mStorage(pool) {
+        mStorage.resize(HAJIMI_STORAGE_SIZE);
+    }
+    MessageReader(MessageReader &&) = default;
+
+    // Read the header and payload into the storage, return the Message
+    auto readMessage() -> ilias::IoTask<Message>;
+private:
+    ilias::ReadableView        mStream;
+    std::pmr::memory_resource *mPool; // The pool for the message
+    BytesVector                mStorage{mPool};
+};
+
+inline auto MessageReader::readMessage() -> ilias::IoTask<Message> {
+    assert(mStorage.size() >= HAJIMI_STORAGE_SIZE && "Ensure the storage is bigger than the max payload size");
     // TODO: Optomize the io calls
-    ILIAS_CO_TRY(auto len, co_await stream.readUint16BE());
-    ILIAS_CO_TRY(auto type, co_await stream.readUint8());
-    auto span = storage.subspan(0, len);
+    ILIAS_CO_TRY(auto len, co_await mStream.readUint16BE());
+    ILIAS_CO_TRY(auto type, co_await mStream.readUint8());
+    auto span = std::span{mStorage}.subspan(0, len);
     if (len != 0) {
-        ILIAS_CO_TRYV(co_await stream.readAll(span));
+        ILIAS_CO_TRYV(co_await mStream.readAll(span));
     }
 
     ilias::MemReader reader{span};
@@ -236,7 +251,7 @@ inline auto readMessage(ilias::ReadableView stream, ilias::MutableBuffer storage
             co_return Message {
                 DataExchange {
                     .streamId = streamId,
-                    .data = BytesVector{data.begin(), data.end()},
+                    .data = BytesVector{data.begin(), data.end(), mPool},
                 }
             };
         }
@@ -271,10 +286,24 @@ inline auto readMessage(ilias::ReadableView stream, ilias::MutableBuffer storage
 }
 
 // MARK: Serilize
-inline auto writeMessage(ilias::WritableView stream, ilias::MutableBuffer storage, Message msg) -> ilias::IoTask<void> {
-    assert(storage.size_bytes() >= HAJIMI_STORAGE_SIZE && "Ensure the storage is bigger than the max payload size + header");
+class MessageWriter {
+public:
+    MessageWriter(ilias::WritableView stream, std::pmr::memory_resource *pool) : mStream(stream), mPool(pool), mStorage(pool) {
+        mStorage.resize(HAJIMI_STORAGE_SIZE);
+    }
+    MessageWriter(MessageWriter &&) = default;
+
+    auto writeMessage(Message msg) -> ilias::IoTask<void>;
+private:
+    ilias::WritableView        mStream;
+    std::pmr::memory_resource *mPool; // The pool for the message
+    BytesVector                mStorage{mPool};
+};
+
+inline auto MessageWriter::writeMessage(Message msg) -> ilias::IoTask<void> {
+    assert(mStorage.size() >= HAJIMI_STORAGE_SIZE && "Ensure the storage is bigger than the max payload size + header");
     // The number of bytes of the message
-    std::byte *end = storage.data() + HAJIMI_HEADER;
+    std::byte *end = mStorage.data() + HAJIMI_HEADER;
     uint16_t len = 0;
 
     // Utils lambda
@@ -341,11 +370,11 @@ inline auto writeMessage(ilias::WritableView stream, ilias::MutableBuffer storag
 
     // Combine to storage
     auto beLen = ilias::networkToHost(len); // To be
-    ::memcpy(storage.data(), &beLen, sizeof(beLen));
-    storage[sizeof(len)] = std::byte{type};
+    ::memcpy(mStorage.data(), &beLen, sizeof(beLen));
+    mStorage[sizeof(len)] = std::byte{type};
 
-    auto write = storage.subspan(0, HAJIMI_HEADER + len);
-    ILIAS_CO_TRYV(co_await stream.writeAll(write));
-    ILIAS_CO_TRYV(co_await stream.flush());
+    auto write = std::span{mStorage}.subspan(0, HAJIMI_HEADER + len);
+    ILIAS_CO_TRYV(co_await mStream.writeAll(write));
+    ILIAS_CO_TRYV(co_await mStream.flush());
     co_return {};
 }

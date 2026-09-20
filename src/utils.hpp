@@ -3,12 +3,12 @@
 #include <ilias/task.hpp>
 #include <ilias/net.hpp>
 #include <ilias/io.hpp>
+
 #include <algorithm>
 #include <vector>
 #include <print>
 
-// Bytes vector...
-using BytesVector = std::pmr::vector<std::byte>;
+#include "common.hpp"
 
 // ScopeExit
 template <typename Fn>

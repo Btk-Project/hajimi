@@ -105,8 +105,8 @@ public:
     // Sub worker
     auto pingWorker() -> IoTask<void>;
     auto rateWorker() -> IoTask<void>;
-    auto readWorker(ReadableView, ReadBuffer &buf) -> IoTask<void>;
-    auto writeWorker(WritableView, WriteBuffer &buf, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void>;
+    auto readWorker(MessageReader &reader) -> IoTask<void>;
+    auto writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void>;
     auto tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::string host, uint16_t port) -> IoTask<void>;
 };
 
@@ -164,20 +164,20 @@ auto ProxyServer::run() -> IoTask<void> {
 }
 
 auto ProxyServer::handleSession(TcpStream stream) -> IoTask<void> {
-    auto writeBuffer = std::make_unique<WriteBuffer>();
-    auto readBuffer = std::make_unique<ReadBuffer>();
     auto session = std::make_shared<ClientSession>();
+    MessageReader reader{stream, &session->mPool};
+    MessageWriter writer{stream, &session->mPool};
 
     co_return co_await TaskScope::enter([&](TaskScope &scope) -> IoTask<void> {
         session->mScope = &scope;
         // First, read and parse hello
         Hello hello{};
         {
-            ILIAS_CO_TRY(auto msg, co_await readMessage(stream, *readBuffer));
+            ILIAS_CO_TRY(auto msg, co_await reader.readMessage());
             ILIAS_CO_TRY(hello, msg.cast<Hello>());
             if (hello.version != HAJIMI_VERSION) {
                 std::println("[ProxyServer] Unexpected version {}, expected {}", hello.version, HAJIMI_VERSION);
-                auto _ = co_await writeMessage(stream, *writeBuffer, FatalError {
+                auto _ = co_await writer.writeMessage(FatalError {
                     .msg = std::format("Version mismatch {}, expected: {}", hello.version, HAJIMI_VERSION)
                 });
                 co_return {};
@@ -193,7 +193,7 @@ auto ProxyServer::handleSession(TcpStream stream) -> IoTask<void> {
             auto [it, emplace] = mSessions.emplace(hello.name, session);
             if (!emplace) {
                 std::println("[ProxyServer] Failed to register '{}', already exists?", hello.name);
-                auto _ = co_await writeMessage(stream, *writeBuffer, FatalError { .msg = "Name already exists" });
+                auto _ = co_await writer.writeMessage(FatalError { .msg = "Name already exists" });
                 co_return {};
             }
         }
@@ -206,14 +206,14 @@ auto ProxyServer::handleSession(TcpStream stream) -> IoTask<void> {
             scope.stop();
         }};
         // Reply with Ack
-        ILIAS_CO_TRYV(co_await writeMessage(stream, *writeBuffer, HelloAck{}));
+        ILIAS_CO_TRYV(co_await writer.writeMessage(HelloAck{}));
 
         // Do the main loop
         auto [sender, receiver] = ilias::mpsc::channel<Message>(); // Unbound
         session->mMessageSender = sender;
         auto _ = co_await ilias::whenAny(
-            session->readWorker(stream, *readBuffer),
-            session->writeWorker(stream, *writeBuffer, std::move(receiver)),
+            session->readWorker(reader),
+            session->writeWorker(writer, std::move(receiver)),
             session->pingWorker(),
             session->rateWorker()
         );
@@ -356,10 +356,10 @@ catch (std::exception &exp) {
 }
 
 // MARK: ClientSession
-auto ClientSession::readWorker(ReadableView stream, ReadBuffer &readBuffer) -> IoTask<void> {
+auto ClientSession::readWorker(MessageReader &reader) -> IoTask<void> {
     using namespace std::chrono_literals;
     while (true) {
-        ILIAS_CO_TRY(auto msg, co_await readMessage(stream, readBuffer));
+        ILIAS_CO_TRY(auto msg, co_await reader.readMessage());
         switch (msg.type()) {
             case MessageType::Pong: {
                 auto now = std::chrono::steady_clock::now();
@@ -424,9 +424,9 @@ auto ClientSession::readWorker(ReadableView stream, ReadBuffer &readBuffer) -> I
     }
 }
 
-auto ClientSession::writeWorker(WritableView stream, WriteBuffer &writeBuffer, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void> {
+auto ClientSession::writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void> {
     while (auto msg = co_await receiver.recv()) {
-        ILIAS_CO_TRYV(co_await writeMessage(stream, writeBuffer, std::move(*msg)));
+        ILIAS_CO_TRYV(co_await writer.writeMessage(std::move(*msg)));
     }
     co_return {};
 }
@@ -524,7 +524,7 @@ auto ClientSession::tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::
             buffer = buffer.subspan(0, n);
             auto _ = mMessageSender.trySend(DataExchange {
                 .streamId = streamId,
-                .data = BytesVector{buffer.begin(), buffer.end()}
+                .data = BytesVector{buffer.begin(), buffer.end(), &mPool}
             });
             // Count downloaded bytes for client
             mDownloadBytes += n;
@@ -580,7 +580,7 @@ auto ProxyRule::run() -> IoTask<void> {
                 continue;
             }
             auto &[sock, addr] = *incoming;
-            (void) sock.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
+            auto _ = sock.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
             std::println("[ProxyRule] {}, new connection from {}", mEndpoint, addr);
 
             // Try find the client

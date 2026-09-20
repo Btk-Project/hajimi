@@ -51,11 +51,11 @@ public:
     ilias::mpsc::Sender<Message> mMessageSender;
 
     // Pool
-    std::pmr::unsynchronized_pool_resource mPool;
+    std::pmr::unsynchronized_pool_resource *mPool;
 
     // Workers
-    auto readWorker(ReadableView, ReadBuffer &buf) -> IoTask<void>;
-    auto writeWorker(WritableView, WriteBuffer &buf, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void>;
+    auto readWorker(MessageReader &reader) -> IoTask<void>;
+    auto writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void>;
     auto tunnelWorker(uint64_t streamId, std::string endpoint, Tunnel::Ptr tunnel) -> IoTask<void>;
 };
 
@@ -91,20 +91,21 @@ auto ProxyClient::connectOnce(bool &registered) -> IoTask<void> {
     // Resolve the master address, it may be a domain name (re-resolve on each reconnect)
     ILIAS_CO_TRY(auto info, co_await ilias::AddressInfo::lookup(mConfig.master));
     ILIAS_CO_TRY(auto stream, co_await happy_eyeballs::connect(info.endpoints()));
-    (void) stream.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
+    auto _ = stream.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
 
     // Do handshake
-    auto writeBuffer = std::make_unique<WriteBuffer>();
-    auto readBuffer = std::make_unique<ReadBuffer>();
+    std::pmr::unsynchronized_pool_resource pool;
+    MessageReader reader{stream, &pool};
+    MessageWriter writer{stream, &pool};
 
     std::println("[ProxyClient] Connected to master {}", mConfig.master);
 
     // Register and wait for the ack
-    ILIAS_CO_TRYV(co_await writeMessage(stream, *writeBuffer, Hello {
+    ILIAS_CO_TRYV(co_await writer.writeMessage(Hello {
         .version = HAJIMI_VERSION,
         .name = mConfig.name,
     }));
-    ILIAS_CO_TRY(auto msg, co_await readMessage(stream, *readBuffer));
+    ILIAS_CO_TRY(auto msg, co_await reader.readMessage());
     if (msg.type() == MessageType::FatalError) {
         std::println("[ProxyClient] Master rejected the registration, Fatal error from master: {}", msg.cast<FatalError>().value().msg);
         co_return {};
@@ -122,23 +123,24 @@ auto ProxyClient::connectOnce(bool &registered) -> IoTask<void> {
     ClientState state {
         .mMaster = mConfig.master,
         .mMessageSender = sender,
+        .mPool = &pool
     };
     co_return co_await TaskScope::enter([&](auto &scope) -> IoTask<void> {
         // If any error, we stop the whole scope
         state.mScope = &scope;
         auto _ = co_await ilias::whenAny(
-            state.readWorker(stream, *readBuffer),
-            state.writeWorker(stream, *writeBuffer, std::move(receiver))
+            state.readWorker(reader),
+            state.writeWorker(writer, std::move(receiver))
         );
         scope.stop();
         co_return {};
     });
 }
 
-auto ClientState::readWorker(ReadableView stream, ReadBuffer &readBuffer) -> IoTask<void> {
+auto ClientState::readWorker(MessageReader &reader) -> IoTask<void> {
     using namespace std::chrono_literals;
     while (true) {
-        ILIAS_CO_TRY(auto msg, co_await readMessage(stream, readBuffer));
+        ILIAS_CO_TRY(auto msg, co_await reader.readMessage());
         switch (msg.type()) {
             case MessageType::Ping: { // Reply Pong
                 auto _ = mMessageSender.trySend(Pong{});
@@ -200,9 +202,9 @@ auto ClientState::readWorker(ReadableView stream, ReadBuffer &readBuffer) -> IoT
     }
 }
 
-auto ClientState::writeWorker(WritableView stream, WriteBuffer &writeBuffer, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void> {
+auto ClientState::writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void> {
     while (auto msg = co_await receiver.recv()) {
-        ILIAS_CO_TRYV(co_await writeMessage(stream, writeBuffer, std::move(*msg)));
+        ILIAS_CO_TRYV(co_await writer.writeMessage(std::move(*msg)));
     }
     co_return {};
 }
@@ -223,7 +225,7 @@ auto ClientState::tunnelWorker(uint64_t streamId, std::string endpoint, Tunnel::
 
     ILIAS_CO_TRY(auto info, co_await ilias::AddressInfo::lookup(endpoint));
     ILIAS_CO_TRY(auto local, co_await happy_eyeballs::connect(info.endpoints()));
-    (void) local.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
+    auto _ = local.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
 
     // Got stream, begin copy
     auto readCopyWorker = [&]() -> IoTask<void> {
@@ -244,7 +246,7 @@ auto ClientState::tunnelWorker(uint64_t streamId, std::string endpoint, Tunnel::
             buffer = buffer.subspan(0, n);
             auto _ = mMessageSender.trySend(DataExchange {
                 .streamId = streamId,
-                .data = BytesVector{buffer.begin(), buffer.end()}
+                .data = BytesVector{buffer.begin(), buffer.end(), mPool}
             });
             tunnel->sendWindow -= n;
         }
