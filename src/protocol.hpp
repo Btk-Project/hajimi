@@ -13,7 +13,7 @@
 #include <span>
 #include <bit>
 
-#include "common.hpp"
+#include "skbuf.hpp"
 
 // MARK: Protocol
 // Current used version (increase it of the protocol changes)
@@ -31,8 +31,21 @@
 // The init window size of the stream
 #define HAJIMI_INIT_WINDOW_SIZE (1024 * 128)
 
-// Bytes vector...
-using BytesVector = std::pmr::vector<std::byte>;
+// The header room size (larger than the header size for more safe)
+#define HAJIMI_HEADER_ROOM (HAJIMI_HEADER + sizeof(uint64_t) * 2)
+
+// The config  of the buffer pool
+constexpr auto HAJIMI_POOL_CONFIG = std::initializer_list<SkBufferPool::ClassInfo> {
+    {   256, 128 },
+    {   512,  64 },
+    {  1024,  64 },
+    {  2048,  32 },
+    {  4096,  16 },
+    {  8192,   8 },
+    { 16384,   8 },
+    { 32768,   4 },
+    { 65600,   2 },
+};
 
 // Each message is packed by
 // u16   size (payload length)
@@ -71,7 +84,7 @@ struct OpenTunnel {
 // u8 [] data
 struct DataExchange {
     uint64_t streamId;
-    BytesVector data; // The message of the data
+    SkBuffer data; // The message of the data (must alloced with the headroom of HAJIMI_HEADER_ROOM)
 };
 
 // WindowUpdate between client <-> server
@@ -167,29 +180,32 @@ private:
 // MARK: Deserilize
 class MessageReader {
 public:
-    MessageReader(ilias::ReadableView stream, std::pmr::memory_resource *pool) : mStream(stream), mPool(pool), mStorage(pool) {
-        mStorage.resize(HAJIMI_STORAGE_SIZE);
-    }
+    MessageReader(ilias::ReadableView stream, SkBufferPool &pool) : mStream(stream), mPool(pool) {}
     MessageReader(MessageReader &&) = default;
 
     // Read the header and payload into the storage, return the Message
     auto readMessage() -> ilias::IoTask<Message>;
 private:
-    ilias::ReadableView        mStream;
-    std::pmr::memory_resource *mPool; // The pool for the message
-    BytesVector                mStorage{mPool};
+    ilias::ReadableView mStream;
+    SkBufferPool       &mPool; // The pool for the message
+    SkBuffer            mBuffer; // The current used buffer
 };
 
 inline auto MessageReader::readMessage() -> ilias::IoTask<Message> {
-    assert(mStorage.size() >= HAJIMI_STORAGE_SIZE && "Ensure the storage is bigger than the max payload size");
     // TODO: Optomize the io calls
     ILIAS_CO_TRY(auto len, co_await mStream.readUint16BE());
     ILIAS_CO_TRY(auto type, co_await mStream.readUint8());
-    auto span = std::span{mStorage}.subspan(0, len);
     if (len != 0) {
+        if (mBuffer.capacity() < len) {
+            mBuffer = mPool.allocate(len);
+        }
+        mBuffer.clear();
+        auto span = mBuffer.prepareBack(len);
         ILIAS_CO_TRYV(co_await mStream.readAll(span));
+        mBuffer.commitBack(len);
     }
 
+    auto span = mBuffer.data();
     ilias::MemReader reader{span};
     switch (static_cast<MessageType>(type)) {
         case MessageType::Hello: {
@@ -246,12 +262,12 @@ inline auto MessageReader::readMessage() -> ilias::IoTask<Message> {
 
         case MessageType::DataExchange: {
             ILIAS_CO_TRY(auto streamId, co_await reader.readUint64BE());
-            auto data = span.subspan(sizeof(streamId)); // Skip the streamId
+            mBuffer.consumeFront(sizeof(streamId)); // Skip the streamId
             // std::println("[Protocol] DataExchange {}, {} bytes", streamId, data.size());
             co_return Message {
                 DataExchange {
                     .streamId = streamId,
-                    .data = BytesVector{data.begin(), data.end(), mPool},
+                    .data = std::exchange(mBuffer, SkBuffer{}),
                 }
             };
         }
@@ -288,40 +304,28 @@ inline auto MessageReader::readMessage() -> ilias::IoTask<Message> {
 // MARK: Serilize
 class MessageWriter {
 public:
-    MessageWriter(ilias::WritableView stream, std::pmr::memory_resource *pool) : mStream(stream), mPool(pool), mStorage(pool) {
-        mStorage.resize(HAJIMI_STORAGE_SIZE);
+    MessageWriter(ilias::WritableView stream, SkBufferPool &pool) : mStream(stream), mPool(pool) {
+        mBuffer = mPool.allocate(256); // A Small buffer for tiny message
     }
     MessageWriter(MessageWriter &&) = default;
 
     auto writeMessage(Message msg) -> ilias::IoTask<void>;
 private:
-    ilias::WritableView        mStream;
-    std::pmr::memory_resource *mPool; // The pool for the message
-    BytesVector                mStorage{mPool};
+    ilias::WritableView  mStream;
+    SkBufferPool        &mPool; // The pool for the message
+    SkBuffer             mBuffer;
 };
 
 inline auto MessageWriter::writeMessage(Message msg) -> ilias::IoTask<void> {
-    assert(mStorage.size() >= HAJIMI_STORAGE_SIZE && "Ensure the storage is bigger than the max payload size + header");
     // The number of bytes of the message
-    std::byte *end = mStorage.data() + HAJIMI_HEADER;
-    uint16_t len = 0;
-
-    // Utils lambda
-    auto appendBytes = [&](ilias::Buffer bytes) {
-        ::memcpy(end, bytes.data(), bytes.size());
-        end += bytes.size();
-        len += bytes.size();
-    };
-    auto appendInt = [&](auto i) {
-        auto be = ilias::hostToNetwork(i);
-        appendBytes(std::bit_cast<std::array<std::byte, sizeof(be)>>(be));
-    };
+    mBuffer.clear();
+    mBuffer.reserveHead(HAJIMI_HEADER_ROOM);
 
     switch (msg.type()) {
         case MessageType::Hello: {
             auto hello = msg.cast<Hello>().value();
-            appendInt(hello.version);
-            appendBytes(ilias::makeBuffer(hello.name));
+            mBuffer.appendIntBE(hello.version);
+            mBuffer.append(ilias::makeBuffer(hello.name));
             break;
         }
         case MessageType::HelloAck: break; // No-payload
@@ -330,34 +334,43 @@ inline auto MessageWriter::writeMessage(Message msg) -> ilias::IoTask<void> {
 
         case MessageType::OpenTunnel: {
             auto tunnel = msg.cast<OpenTunnel>().value();
-            appendInt(tunnel.streamId);
-            appendBytes(ilias::makeBuffer(tunnel.endpoint));
+            mBuffer.appendIntBE(tunnel.streamId);
+            mBuffer.append(ilias::makeBuffer(tunnel.endpoint));
             break;
         }
-
-        case MessageType::DataExchange: {
+         case MessageType::DataExchange: {
             auto exchange = msg.cast<DataExchange>().value();
-            appendInt(exchange.streamId);
-            appendBytes(exchange.data);
-            break;
+            auto buffer = std::exchange(exchange.data, SkBuffer{});
+            // We just use the message buffer, avoid the copy
+            // len | type | streamId | data |
+            assert(buffer.headroom() >= HAJIMI_HEADER_ROOM && "This buffer is too small");
+            buffer.prependIntBE(exchange.streamId);
+            auto size = buffer.size(); // The size only contains streamId + data
+
+            buffer.prependIntBE(static_cast<uint8_t>(MessageType::DataExchange));
+            buffer.prependIntBE(static_cast<uint16_t>(size));
+
+            // Write it
+            ILIAS_CO_TRYV(co_await mStream.writeAll(buffer.data()));
+            co_return co_await mStream.flush();
         }
 
         case MessageType::TunnelClose: {
             auto close = msg.cast<TunnelClose>().value();
-            appendInt(close.streamId);
+            mBuffer.appendIntBE(close.streamId);
             break;
         }
 
         case MessageType::WindowUpdate: {
             auto update = msg.cast<WindowUpdate>().value();
-            appendInt(update.streamId);
-            appendInt(update.size);
+            mBuffer.appendIntBE(update.streamId);
+            mBuffer.appendIntBE(update.size);
             break;
         }
 
         case MessageType::FatalError: {
             auto err = msg.cast<FatalError>().value();
-            appendBytes(ilias::makeBuffer(err.msg));
+            mBuffer.append(ilias::makeBuffer(err.msg));
             break;
         }
 
@@ -365,16 +378,15 @@ inline auto MessageWriter::writeMessage(Message msg) -> ilias::IoTask<void> {
             assert(false && "TODO: Currently not impl");
         }
     }
-    // Write the payload len
-    uint8_t type = static_cast<uint8_t>(msg.type());
+    // Store how many bytes we are used
+    auto size = mBuffer.size();
 
-    // Combine to storage
-    auto beLen = ilias::networkToHost(len); // To be
-    ::memcpy(mStorage.data(), &beLen, sizeof(beLen));
-    mStorage[sizeof(len)] = std::byte{type};
+    // | Size | Type | Data |
+    mBuffer.prependIntBE(static_cast<uint8_t>(msg.type()));
+    mBuffer.prependIntBE(static_cast<uint16_t>(size));
 
-    auto write = std::span{mStorage}.subspan(0, HAJIMI_HEADER + len);
-    ILIAS_CO_TRYV(co_await mStream.writeAll(write));
+    // Write a;;
+    ILIAS_CO_TRYV(co_await mStream.writeAll(mBuffer.data()));
     ILIAS_CO_TRYV(co_await mStream.flush());
     co_return {};
 }

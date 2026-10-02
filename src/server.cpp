@@ -66,7 +66,7 @@ public:
         ilias::Event closed{}; //< Set when closed
 
         // For sending the data frame
-        ilias::mpsc::Sender<BytesVector> bytesSender;
+        ilias::mpsc::Sender<SkBuffer> bytesSender;
     };
 
     // Scope
@@ -100,7 +100,7 @@ public:
     std::map<std::uint64_t, Tunnel::Ptr> mTunnels;
 
     // Pool
-    std::pmr::unsynchronized_pool_resource mPool;
+    SkBufferPool mPool{HAJIMI_POOL_CONFIG};
 
     // Sub worker
     auto pingWorker() -> IoTask<void>;
@@ -165,8 +165,8 @@ auto ProxyServer::run() -> IoTask<void> {
 
 auto ProxyServer::handleSession(TcpStream stream) -> IoTask<void> {
     auto session = std::make_shared<ClientSession>();
-    MessageReader reader{stream, &session->mPool};
-    MessageWriter writer{stream, &session->mPool};
+    MessageReader reader{stream, session->mPool};
+    MessageWriter writer{stream, session->mPool};
 
     co_return co_await TaskScope::enter([&](TaskScope &scope) -> IoTask<void> {
         session->mScope = &scope;
@@ -475,7 +475,7 @@ auto ClientSession::tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::
     std::println("[ClientSession] {} request to open tunnel to {}:{}", mName, host, port);
 
     // Register it
-    auto [sender, receiver] = ilias::mpsc::channel<BytesVector>();
+    auto [sender, receiver] = ilias::mpsc::channel<SkBuffer>();
     Tunnel::Ptr tunnel {
         new Tunnel { // In place
             .bytesSender = std::move(sender),
@@ -521,10 +521,16 @@ auto ClientSession::tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::
             if (n == 0) { // EOF
                 break;
             }
+
+            // TODO: Zero copy
             buffer = buffer.subspan(0, n);
+            auto data = mPool.allocate(buffer.size() + HAJIMI_HEADER_ROOM);
+            data.reserveHead(HAJIMI_HEADER_ROOM);
+            data.append(buffer);
+
             auto _ = mMessageSender.trySend(DataExchange {
                 .streamId = streamId,
-                .data = BytesVector{buffer.begin(), buffer.end(), &mPool}
+                .data = std::move(data)
             });
             // Count downloaded bytes for client
             mDownloadBytes += n;
@@ -537,7 +543,7 @@ auto ClientSession::tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::
         while (auto bytes = co_await receiver.recv()) {
             // Send bytes to local stream
             // std::println("[ProxyServer] Tunnel '{}' write {} bytes data to local", streamId, bytes->size());
-            ILIAS_CO_TRYV(co_await local.writeAll(*bytes));
+            ILIAS_CO_TRYV(co_await local.writeAll(bytes->data()));
 
             // Update the peer send window
             peerSum += bytes->size();

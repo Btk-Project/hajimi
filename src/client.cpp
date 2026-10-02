@@ -11,6 +11,7 @@
 
 #include "protocol.hpp"
 #include "client.hpp"
+#include "skbuf.hpp"
 #include "utils.hpp"
 
 // Import types
@@ -34,8 +35,8 @@ public:
         ilias::Event closed{}; //< Set when closed
 
         // For sending the data frame
-        ilias::mpsc::Sender<BytesVector> bytesSender;
-        ilias::mpsc::Receiver<BytesVector> bytesReceiver;
+        ilias::mpsc::Sender<SkBuffer> bytesSender;
+        ilias::mpsc::Receiver<SkBuffer> bytesReceiver;
     };
 
     // ServerInfo
@@ -51,7 +52,7 @@ public:
     ilias::mpsc::Sender<Message> mMessageSender;
 
     // Pool
-    std::pmr::unsynchronized_pool_resource *mPool;
+    SkBufferPool *mPool;
 
     // Workers
     auto readWorker(MessageReader &reader) -> IoTask<void>;
@@ -94,9 +95,9 @@ auto ProxyClient::connectOnce(bool &registered) -> IoTask<void> {
     auto _ = stream.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
 
     // Do handshake
-    std::pmr::unsynchronized_pool_resource pool;
-    MessageReader reader{stream, &pool};
-    MessageWriter writer{stream, &pool};
+    SkBufferPool pool{HAJIMI_POOL_CONFIG};
+    MessageReader reader{stream, pool};
+    MessageWriter writer{stream, pool};
 
     std::println("[ProxyClient] Connected to master {}", mConfig.master);
 
@@ -149,7 +150,7 @@ auto ClientState::readWorker(MessageReader &reader) -> IoTask<void> {
             case MessageType::OpenTunnel: { // Request to open tunnel
                 ILIAS_CO_TRY(auto tunnel, msg.cast<OpenTunnel>());
                 // Synchronously create and register channel before next message can arrive
-                auto [sender, receiver] = ilias::mpsc::channel<BytesVector>();
+                auto [sender, receiver] = ilias::mpsc::channel<SkBuffer>();
                 Tunnel::Ptr tunnelPtr {
                     new Tunnel { // In place
                         .bytesSender = std::move(sender),
@@ -225,7 +226,7 @@ auto ClientState::tunnelWorker(uint64_t streamId, std::string endpoint, Tunnel::
 
     ILIAS_CO_TRY(auto info, co_await ilias::AddressInfo::lookup(endpoint));
     ILIAS_CO_TRY(auto local, co_await happy_eyeballs::connect(info.endpoints()));
-    auto _ = local.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
+    std::ignore = local.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
 
     // Got stream, begin copy
     auto readCopyWorker = [&]() -> IoTask<void> {
@@ -243,10 +244,16 @@ auto ClientState::tunnelWorker(uint64_t streamId, std::string endpoint, Tunnel::
             if (n == 0) { // EOF
                 break;
             }
+
+            // TODO: Zero copy
             buffer = buffer.subspan(0, n);
+            auto data = mPool->allocate(buffer.size() + HAJIMI_HEADER_ROOM);
+            data.reserveHead(HAJIMI_HEADER_ROOM);
+            data.append(buffer);
+            
             auto _ = mMessageSender.trySend(DataExchange {
                 .streamId = streamId,
-                .data = BytesVector{buffer.begin(), buffer.end(), mPool}
+                .data = std::move(data)
             });
             tunnel->sendWindow -= n;
         }
@@ -257,7 +264,7 @@ auto ClientState::tunnelWorker(uint64_t streamId, std::string endpoint, Tunnel::
         while (auto bytes = co_await tunnel->bytesReceiver.recv()) {
             // Send bytes to local stream
             // std::println("[ClientState] Tunnel '{}' write {} bytes data to local", streamId, bytes->size());
-            ILIAS_CO_TRYV(co_await local.writeAll(*bytes));
+            ILIAS_CO_TRYV(co_await local.writeAll(bytes->data()));
 
             // Update the peer send window
             peerSum += bytes->size();
