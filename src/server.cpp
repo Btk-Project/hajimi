@@ -507,30 +507,23 @@ auto ClientSession::tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::
 
     // Begin copy
     auto readCopyWorker = [&]() -> IoTask<void> {
-        std::array<std::byte, HAJIMI_MAX_DATA_EXCHANGE> storage;
         while (true) {
             while (tunnel->sendWindow == 0) { // Waiting for the send window
                 co_await tunnel->sendWindowUpdated.wait();
             }
-            auto buffer = std::span{storage}.subspan(
-                0,
-                std::min(tunnel->sendWindow, storage.size())
-            ); // Read the number of bytes in the send window
-            ILIAS_CO_TRY(auto n, co_await local.read(buffer));
+            auto bufsize = std::min(HAJIMI_MAX_DATA_EXCHANGE, tunnel->sendWindow);
+            auto skbuf = mPool.allocate(HAJIMI_HEADER_ROOM + bufsize);
+            skbuf.reserveHead(HAJIMI_HEADER_ROOM);
 
+            ILIAS_CO_TRY(auto n, co_await local.read(skbuf.prepareBack(bufsize)));
+            skbuf.commitBack(n);
             if (n == 0) { // EOF
                 break;
             }
 
-            // TODO: Zero copy
-            buffer = buffer.subspan(0, n);
-            auto data = mPool.allocate(buffer.size() + HAJIMI_HEADER_ROOM);
-            data.reserveHead(HAJIMI_HEADER_ROOM);
-            data.append(buffer);
-
             auto _ = mMessageSender.trySend(DataExchange {
                 .streamId = streamId,
-                .data = std::move(data)
+                .data = std::move(skbuf)
             });
             // Count downloaded bytes for client
             mDownloadBytes += n;

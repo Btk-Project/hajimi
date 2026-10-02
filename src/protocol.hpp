@@ -186,6 +186,8 @@ public:
     // Read the header and payload into the storage, return the Message
     auto readMessage() -> ilias::IoTask<Message>;
 private:
+    static auto parse(uint8_t type, SkBuffer &buffer) -> std::optional<Message>;
+
     ilias::ReadableView mStream;
     SkBufferPool       &mPool; // The pool for the message
     SkBuffer            mBuffer; // The current used buffer
@@ -193,8 +195,12 @@ private:
 
 inline auto MessageReader::readMessage() -> ilias::IoTask<Message> {
     // TODO: Optomize the io calls
-    ILIAS_CO_TRY(auto len, co_await mStream.readUint16BE());
-    ILIAS_CO_TRY(auto type, co_await mStream.readUint8());
+    std::byte header[HAJIMI_HEADER] {};
+    ILIAS_CO_TRYV(co_await mStream.readAll(header));
+
+    uint16_t len = std::to_integer<uint16_t>(header[0]) << 8 | std::to_integer<uint16_t>(header[1]);
+    uint8_t type = std::to_integer<uint8_t>(header[2]);
+
     if (len != 0) {
         if (mBuffer.capacity() < len) {
             mBuffer = mPool.allocate(len);
@@ -204,17 +210,20 @@ inline auto MessageReader::readMessage() -> ilias::IoTask<Message> {
         ILIAS_CO_TRYV(co_await mStream.readAll(span));
         mBuffer.commitBack(len);
     }
+    if (auto msg = parse(type, mBuffer)) {
+        co_return std::move(*msg);
+    }
+    co_return ilias::Err(std::make_error_code(std::errc::bad_message));
+}
 
-    auto span = mBuffer.data();
-    ilias::MemReader reader{span};
+inline auto MessageReader::parse(uint8_t type, SkBuffer &buffer) -> std::optional<Message> {
     switch (static_cast<MessageType>(type)) {
         case MessageType::Hello: {
-            std::string name;
-            ILIAS_CO_TRY(auto version, co_await reader.readUint16BE());
-            ILIAS_CO_TRYV(co_await reader.readToEnd(name));
+            ILIAS_TRY(auto version, buffer.popIntBE<uint16_t>());
+            ILIAS_TRY(auto name, buffer.popString());
 
             // std::println("[Protocol] Hello: {}, {}", version, name);
-            co_return Message {
+            return Message {
                 Hello {
                     .version = version,
                     .name = std::move(name),
@@ -224,25 +233,24 @@ inline auto MessageReader::readMessage() -> ilias::IoTask<Message> {
 
         case MessageType::HelloAck: {
             // std::println("[Protocol] HelloAck");
-            co_return Message { HelloAck{} };
+            return Message { HelloAck{} };
         }
 
         case MessageType::Ping: {
             // std::println("[Protocol] Ping");
-            co_return Message { Ping{} };
+            return Message { Ping{} };
         }
 
         case MessageType::Pong: {
             // std::println("[Protocol] Pong");
-            co_return Message { Pong{} };
+            return Message { Pong{} };
         }
 
         case MessageType::OpenTunnel: {
-            std::string endpoint;
-            ILIAS_CO_TRY(auto streamId, co_await reader.readUint64BE());
-            ILIAS_CO_TRYV(co_await reader.readToEnd(endpoint));
+            ILIAS_TRY(auto streamId, buffer.popIntBE<uint64_t>());
+            ILIAS_TRY(auto endpoint, buffer.popString());
             // std::println("[Protocol] OpenTunnel {} => {}", streamId, endpoint);
-            co_return Message {
+            return Message {
                 OpenTunnel {
                     .streamId = streamId,
                     .endpoint = std::move(endpoint)
@@ -251,9 +259,9 @@ inline auto MessageReader::readMessage() -> ilias::IoTask<Message> {
         }
 
         case MessageType::TunnelClose: {
-            ILIAS_CO_TRY(auto streamId, co_await reader.readUint64BE());
+            ILIAS_TRY(auto streamId, buffer.popIntBE<uint64_t>());
             // std::println("[Protocol] TunnelClose {}", streamId);
-            co_return Message {
+            return Message {
                 TunnelClose {
                     .streamId = streamId,
                 }
@@ -261,22 +269,21 @@ inline auto MessageReader::readMessage() -> ilias::IoTask<Message> {
         }
 
         case MessageType::DataExchange: {
-            ILIAS_CO_TRY(auto streamId, co_await reader.readUint64BE());
-            mBuffer.consumeFront(sizeof(streamId)); // Skip the streamId
+            ILIAS_TRY(auto streamId, buffer.popIntBE<uint64_t>());
             // std::println("[Protocol] DataExchange {}, {} bytes", streamId, data.size());
-            co_return Message {
+            return Message {
                 DataExchange {
                     .streamId = streamId,
-                    .data = std::exchange(mBuffer, SkBuffer{}),
+                    .data = std::exchange(buffer, SkBuffer{}),
                 }
             };
         }
 
         case MessageType::WindowUpdate: {
-            ILIAS_CO_TRY(auto streamId, co_await reader.readUint64BE());
-            ILIAS_CO_TRY(auto size, co_await reader.readUint32BE());
+            ILIAS_TRY(auto streamId, buffer.popIntBE<uint64_t>());
+            ILIAS_TRY(auto size, buffer.popIntBE<uint32_t>());
             // std::println("[Protocol] WindowUpdate {}, {} bytes", streamId, size);
-            co_return Message {
+            return Message {
                 WindowUpdate {
                     .streamId = streamId,
                     .size = size
@@ -285,10 +292,9 @@ inline auto MessageReader::readMessage() -> ilias::IoTask<Message> {
         }
 
         case MessageType::FatalError: {
-            std::string msg;
-            ILIAS_CO_TRYV(co_await reader.readToEnd(msg));
+            ILIAS_TRY(auto msg, buffer.popString());
             // std::println("[Protocol] FatalError {}", msg);
-            co_return Message {
+            return Message {
                 FatalError {
                     .msg = std::move(msg)
                 }  
@@ -296,7 +302,7 @@ inline auto MessageReader::readMessage() -> ilias::IoTask<Message> {
         }
         default: {
             std::println(stderr, "[Message] readMessage, invalid type: {}", type);
-            co_return ilias::Err(std::make_error_code(std::errc::bad_message));
+            return std::nullopt;
         }
     }
 }

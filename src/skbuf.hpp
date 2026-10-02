@@ -15,15 +15,25 @@
 #include <memory_resource> // pmr::memory_resource
 #include <algorithm> // ranges::sort
 #include <concepts> // integral
+#include <optional> // optional
 #include <cassert> // assert
 #include <cstddef> // size_t
 #include <cstring> // memcpy
+#include <cstdint> // uint32_t
 #include <memory> // unique_ptr
+#include <string> // string
 #include <vector>
 #include <array>
 #include <span> // span
 #include <new>
 #include <bit>
+
+// Align by cacheline, maybe better for performance?
+#ifdef __cpp_lib_hardware_interference_size
+    constexpr auto SKBUFFER_ALIGN = std::hardware_destructive_interference_size;
+#else
+    constexpr auto SKBUFFER_ALIGN = 64;
+#endif // __cpp_lib_hardware_interference_size
 
 // Forward declarations
 class SkBufferPool;
@@ -33,7 +43,7 @@ class SkBuffer;
  * @brief The node of the socket buffer | Node | Storage { HeadRoom, Data, TailRoom } | 
  * 
  */
-class alignas(64) SkBufferNode {
+class alignas(SKBUFFER_ALIGN) SkBufferNode {
 public:
     // Free List
     SkBufferNode *next = nullptr;
@@ -199,8 +209,9 @@ public:
 
     // Get the mutable data begin of the buffer
     [[nodiscard]]
-    auto data() -> std::span<std::byte> {
+    auto mutableData() -> std::span<std::byte> {
         if (!mBuffer) return {};
+        assert(unique() && "Buffer is not unique, it may be shared by others, Please cow before get data");
         return {mBuffer->storage() + mHead, size()};
     }
 
@@ -218,10 +229,17 @@ public:
         return mHead;
     }
 
+    // Get the num of bytes that can be append to the buffer
     [[nodiscard]]
     auto tailroom() const -> std::size_t {
         if (!mBuffer) return 0;
         return mBuffer->capacity - mTail;
+    }
+
+    // Get the buffer pool
+    [[nodiscard]]
+    auto pool() const -> SkBufferPool * {
+        return mBuffer ? &mBuffer->pool : nullptr;
     }
 
 
@@ -231,6 +249,7 @@ public:
     auto prepareBack(std::size_t size) -> std::span<std::byte> {
         assert(mBuffer && "Buffer is not allocated");
         assert(size <= tailroom() && "Buffer is overflow");
+        assert(unique() && "Buffer is not unique, it may be shared by others, Please cow before preapreBack");
         return {mBuffer->storage() + mTail, size};
     }
 
@@ -271,6 +290,7 @@ public:
     // Utils
     // Append datas to the buffer back
     auto append(std::span<const std::byte> data) -> void {
+        if (data.empty()) return;
         auto buf = prepareBack(data.size());
         std::memcpy(buf.data(), data.data(), data.size());
         commitBack(data.size());
@@ -294,6 +314,7 @@ public:
     auto prepend(std::span<const std::byte> data) -> void {
         assert(mBuffer && "Buffer is not allocated");
         assert(mHead >= data.size() && "Buffer is overflow");
+        assert(unique() && "Buffer is not unique, it may be shared by others, Please cow before prepend");
         std::memcpy(mBuffer->storage() + mHead - data.size(), data.data(), data.size());
         mHead -= data.size();
     }
@@ -304,6 +325,39 @@ public:
             val = std::byteswap(val);
         }
         prepend(std::bit_cast<std::array<std::byte, sizeof(val)>>(val));
+    }
+
+    // Pop data from the front of the buffer
+    template <std::integral T>
+    [[nodiscard]]
+    auto popIntBE() -> std::optional<T> {
+        auto buf = data();
+        if (buf.size() < sizeof(T)) return std::nullopt;
+
+        // Load from the buffer (maybe unaligned, use memcpy)
+        T val{};
+        std::memcpy(&val, buf.data(), sizeof(val));
+        consumeFront(sizeof(val));
+        if (std::endian::native != std::endian::big) {
+            val = std::byteswap(val);
+        }
+        return val;
+    }
+
+    // Pop string from the front of the buffer
+    [[nodiscard]]
+    auto popString(std::size_t size) -> std::optional<std::string> {
+        if (!mBuffer || this->size() < size) return std::nullopt;
+        auto buf = data();
+        std::string str{reinterpret_cast<const char *>(buf.data()), size};
+        consumeFront(size);
+        return str;
+    }
+
+    // Pop string from the whole buffer
+    [[nodiscard]]
+    auto popString() -> std::optional<std::string> {
+        return popString(size());
     }
 
     // Swap
@@ -324,6 +378,25 @@ public:
             mTail
         };
     }
+
+    // Slice the buffer
+    [[nodiscard]]
+    auto slice(std::size_t offset, std::size_t len) const -> SkBuffer {
+        assert(offset <= size() && "Offset is overflow");
+        assert(len <= size() - offset && "Length is overflow");
+
+        auto buf = clone();
+        buf.mHead += offset;
+        buf.mTail = buf.mHead + len;
+        return buf;
+    }
+
+    // Make the buffer writable, doing cow
+    // auto makeWritable() -> void {
+    //     if (!mBuffer || unique()) return;
+
+    //     auto buf = mBuffer->pool.allocate(mBuffer->capacity);
+    // }
     
 
     // Operator
@@ -336,7 +409,7 @@ public:
         return static_cast<bool>(mBuffer);
     }
 private:
-    SkBuffer(SkBufferNode *node, std::uint32_t head = 0, std::uint32_t tail = 0) : mBuffer(node), mHead(head), mTail(tail) {}
+    explicit SkBuffer(SkBufferNode *node, std::uint32_t head = 0, std::uint32_t tail = 0) : mBuffer(node), mHead(head), mTail(tail) {}
 
     struct Deleter {
         auto operator()(SkBufferNode *node) -> void {
