@@ -17,22 +17,22 @@
 
 // MARK: Protocol
 // Current used version (increase it of the protocol changes)
-#define HAJIMI_VERSION (uint16_t{0x2})
+constexpr auto HAJIMI_VERSION = uint16_t{0x2};
 
 // The header size 
-#define HAJIMI_HEADER (sizeof(uint16_t) + sizeof(uint8_t))
+constexpr auto HAJIMI_HEADER = sizeof(uint16_t) + sizeof(uint8_t);
 
 // The max size of the message
-#define HAJIMI_STORAGE_SIZE (UINT16_MAX + HAJIMI_HEADER)
+constexpr auto HAJIMI_STORAGE_SIZE = UINT16_MAX + HAJIMI_HEADER;
 
 // The max size of the payload on data exchange message
-#define HAJIMI_MAX_DATA_EXCHANGE (UINT16_MAX - sizeof(uint64_t))
+constexpr auto HAJIMI_MAX_DATA_EXCHANGE = UINT16_MAX - sizeof(uint64_t);
 
 // The init window size of the stream
-#define HAJIMI_INIT_WINDOW_SIZE (1024 * 128)
+constexpr auto HAJIMI_INIT_WINDOW_SIZE = size_t{1024} * 128;
 
 // The header room size (larger than the header size for more safe)
-#define HAJIMI_HEADER_ROOM (HAJIMI_HEADER + sizeof(uint64_t) * 2)
+constexpr auto HAJIMI_HEADER_ROOM = HAJIMI_HEADER + sizeof(uint64_t) * 2;
 
 // The config  of the buffer pool
 constexpr auto HAJIMI_POOL_CONFIG = std::initializer_list<SkBufferPool::ClassInfo> {
@@ -84,7 +84,7 @@ struct OpenTunnel {
 // u8 [] data
 struct DataExchange {
     uint64_t streamId;
-    SkBuffer data; // The message of the data (must alloced with the headroom of HAJIMI_HEADER_ROOM)
+    SkBuffer data; // The message of the data (must alloced with the headroom of HAJIMI_HEADER_ROOM if send to writeMessage)
 };
 
 // WindowUpdate between client <-> server
@@ -194,7 +194,6 @@ private:
 };
 
 inline auto MessageReader::readMessage() -> ilias::IoTask<Message> {
-    // TODO: Optomize the io calls
     std::byte header[HAJIMI_HEADER] {};
     ILIAS_CO_TRYV(co_await mStream.readAll(header));
 
@@ -311,7 +310,7 @@ inline auto MessageReader::parse(uint8_t type, SkBuffer &buffer) -> std::optiona
 class MessageWriter {
 public:
     MessageWriter(ilias::WritableView stream, SkBufferPool &pool) : mStream(stream), mPool(pool) {
-        mBuffer = mPool.allocate(256); // A Small buffer for tiny message
+        mBuffer = mPool.allocate(256); // A Small buffer for tiny control message
     }
     MessageWriter(MessageWriter &&) = default;
 
@@ -350,6 +349,10 @@ inline auto MessageWriter::writeMessage(Message msg) -> ilias::IoTask<void> {
             // We just use the message buffer, avoid the copy
             // len | type | streamId | data |
             assert(buffer.headroom() >= HAJIMI_HEADER_ROOM && "This buffer is too small");
+            if (buffer.size() > HAJIMI_MAX_DATA_EXCHANGE || buffer.headroom() < HAJIMI_HEADER_ROOM) [[unlikely]] {
+                co_return ilias::Err(std::make_error_code(std::errc::bad_message));
+            }
+
             buffer.prependIntBE(exchange.streamId);
             auto size = buffer.size(); // The size only contains streamId + data
 

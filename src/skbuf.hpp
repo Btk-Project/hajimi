@@ -16,6 +16,7 @@
 #include <algorithm> // ranges::sort
 #include <concepts> // integral
 #include <optional> // optional
+#include <utility> // in_range
 #include <cassert> // assert
 #include <cstddef> // size_t
 #include <cstring> // memcpy
@@ -28,13 +29,6 @@
 #include <new>
 #include <bit>
 
-// Align by cacheline, maybe better for performance?
-#ifdef __cpp_lib_hardware_interference_size
-    constexpr auto SKBUFFER_ALIGN = std::hardware_destructive_interference_size;
-#else
-    constexpr auto SKBUFFER_ALIGN = 64;
-#endif // __cpp_lib_hardware_interference_size
-
 // Forward declarations
 class SkBufferPool;
 class SkBuffer;
@@ -43,7 +37,7 @@ class SkBuffer;
  * @brief The node of the socket buffer | Node | Storage { HeadRoom, Data, TailRoom } | 
  * 
  */
-class alignas(SKBUFFER_ALIGN) SkBufferNode {
+class SkBufferNode {
 public:
     // Free List
     SkBufferNode *next = nullptr;
@@ -54,7 +48,7 @@ public:
     std::uint8_t  classIdx = 0xFF; // The class index of the buffer (0xFF on oversize)
 
     // Mutable info
-    std::uint16_t refcount = 0; // The reference count of the buffer
+    std::size_t   refcount = 0; // The reference count of the buffer
 
     // Storage
     // std::byte     storage[];
@@ -211,7 +205,7 @@ public:
     [[nodiscard]]
     auto mutableData() -> std::span<std::byte> {
         if (!mBuffer) return {};
-        assert(unique() && "Buffer is not unique, it may be shared by others, Please cow before get data");
+        assert(unique() && "Buffer is not unique, Please cow before get data");
         return {mBuffer->storage() + mHead, size()};
     }
 
@@ -249,7 +243,7 @@ public:
     auto prepareBack(std::size_t size) -> std::span<std::byte> {
         assert(mBuffer && "Buffer is not allocated");
         assert(size <= tailroom() && "Buffer is overflow");
-        assert(unique() && "Buffer is not unique, it may be shared by others, Please cow before preapreBack");
+        assert(unique() && "Buffer is not unique, Please makeWritable() before preapreBack");
         return {mBuffer->storage() + mTail, size};
     }
 
@@ -314,7 +308,7 @@ public:
     auto prepend(std::span<const std::byte> data) -> void {
         assert(mBuffer && "Buffer is not allocated");
         assert(mHead >= data.size() && "Buffer is overflow");
-        assert(unique() && "Buffer is not unique, it may be shared by others, Please cow before prepend");
+        assert(unique() && "Buffer is not unique, Please makeWritable() before prepend");
         std::memcpy(mBuffer->storage() + mHead - data.size(), data.data(), data.size());
         mHead -= data.size();
     }
@@ -391,12 +385,38 @@ public:
         return buf;
     }
 
-    // Make the buffer writable, doing cow
-    // auto makeWritable() -> void {
-    //     if (!mBuffer || unique()) return;
+    // Move all data to the position after the given headroom
+    auto compact(std::size_t headroom = 0) -> void {
+        assert(mBuffer && "Buffer is not allocated");
+        assert(unique() && "Buffer is not unique, Please makeWritable() before compact");
 
-    //     auto buf = mBuffer->pool.allocate(mBuffer->capacity);
-    // }
+        auto size = this->size();
+        assert(headroom <= capacity() - size && "Buffer is overflow");
+
+        if (size != 0 && mHead != headroom) {
+            std::memmove(
+                mBuffer->storage() + headroom,
+                mBuffer->storage() + mHead,
+                size
+            );
+        }
+
+        mHead = headroom;
+        mTail = headroom + size;
+    }
+
+    // Make the buffer writable, doing cow
+    auto makeWritable() -> void {
+        if (!mBuffer || unique()) return;
+
+        // Allocate same capacity
+        auto buf = pool()->allocate(capacity());
+        buf.mHead = mHead;
+        buf.mTail = mHead; // Currently zero size
+        buf.append(data()); // Copy the data
+
+        swap(buf);
+    }
     
 
     // Operator
