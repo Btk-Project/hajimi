@@ -7,7 +7,7 @@ add_rules("plugin.compile_commands.autoupdate", {outputdir = "build", lsp = "cla
 
 -- Import async runtime
 add_repositories("btk-repo https://github.com/Btk-Project/xmake-repo.git")
-add_requires("ilias")
+add_requires("ilias", {configs = {static = true}})
 
 -- Import json, argparse, etc...
 add_requires("nlohmann_json", "argparse")
