@@ -130,9 +130,8 @@ auto ProxyServer::run() -> IoTask<void> {
     mStartTime = std::chrono::steady_clock::now();
 
     // Make duckdns
-    std::optional<DuckDnsUpdater> duckdns;
     if (!mConfig.duckdnsDomain.empty()) {
-        duckdns.emplace(mConfig.duckdnsDomain, mConfig.duckdnsToken, mConfig.duckdnsInterval);
+        mDuckDns.emplace(mConfig.duckdnsDomain, mConfig.duckdnsToken, mConfig.duckdnsInterval);
     }
 
     // Make an webui
@@ -141,8 +140,8 @@ auto ProxyServer::run() -> IoTask<void> {
     // Handle incoming connection
     auto main = TaskScope::enter([&](auto &scope) -> Task<void> {
         mScope = &scope;
-        if (duckdns) {
-            scope.spawn(duckdns->run());
+        if (mDuckDns) {
+            scope.spawn(mDuckDns->run());
         }
         while (true) {
             auto incoming = co_await listener.accept();
@@ -266,6 +265,27 @@ auto ProxyServer::status() const -> std::string {
         });
     }
 
+    // duckdns
+    // "enabled": True,
+    // "domain": f"{self.domain}.duckdns.org",
+    // "last_update": int(self.last_update_time) if self.last_update_time else None,
+    // "status": self.last_status,
+    // "ipv4": self.last_ipv4,
+    // "ipv6": self.last_ipv6,
+    // "interval_seconds": self.interval,
+    auto duckdns = json{};
+    if (mDuckDns) {
+        duckdns = json {
+            {"enabled", true},
+            {"domain", std::format("{}.duckdns.org", mDuckDns->domain())},
+            {"last_update", 0}, // TODO:
+            {"status", mDuckDns->status()},
+            {"ipv4", mDuckDns->ipv4()},
+            {"ipv6", mDuckDns->ipv6()},
+            {"interval_seconds", mDuckDns->interval().count()}
+        };
+    }
+
     json js {
         {"uptime_seconds", uptime.count()},
         {"master_port", mConfig.listen.port()},
@@ -273,7 +293,8 @@ auto ProxyServer::status() const -> std::string {
         {"webui_port", mConfig.webui.port()},
         {"webui_host", mConfig.webui.address().toString()},
         {"clients", std::move(clients)},
-        {"rules", std::move(rules)}
+        {"rules", std::move(rules)},
+        {"duckdns", std::move(duckdns)},
     };
 
     // return {

@@ -77,6 +77,7 @@ private:
 
     Config mConfig;
     ilias::TaskScope *mScope = nullptr;
+    std::optional<DuckDnsUpdater> mDuckDns; // DuckDns updater, nullopt if ddns is disabled
     std::chrono::steady_clock::time_point mStartTime; // timestamp of inited
     std::map<std::string, std::shared_ptr<ClientSession> > mSessions; // name -> session
     std::map<std::uint16_t, std::shared_ptr<ProxyRule> >   mRules; // The rules of proxy [port: rule]
