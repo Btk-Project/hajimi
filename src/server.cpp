@@ -1,38 +1,35 @@
-#include <nlohmann/json.hpp>
 #include <ilias/macros.hpp>
-#include <ilias/sync.hpp>
-#include <ilias/task.hpp>
-#include <ilias/net.hpp>
-#include <ilias/io.hpp>
 
-#include <memory_resource>
-#include <atomic>
-#include <print>
-
-#include "protocol.hpp"
-#include "duckdns.hpp"
-#include "server.hpp"
-#include "utils.hpp"
-#include "web.hpp"
+module hajimi.server;
+import hajimi.json;
+import hajimi.protocol;
+import hajimi.skbuf;
+import hajimi.utils;
+import hajimi.web;
+import ilias;
+import std;
 
 using ilias::MutableBuffer;
-using ilias::TcpListener;
 using ilias::ReadableView;
 using ilias::WritableView;
+using ilias::TcpListener;
 using ilias::StreamView;
 using ilias::IPEndpoint;
+using ilias::TcpStream;
 using ilias::TaskScope;
+using ilias::IoTask;
 using ilias::Task;
 using ilias::Event;
 using ilias::Mutex;
+using ilias::Result;
 
 // The status of it
 class ProxyStatus final {
 public:
     using Ptr = std::shared_ptr<ProxyStatus>;
 
-    size_t activeConnections = 0;
-    size_t totalConnections = 0;
+    std::size_t activeConnections = 0;
+    std::size_t totalConnections = 0;
 };
 
 // The actived proxy rule
@@ -44,7 +41,7 @@ public:
     IPEndpoint       mEndpoint;
     std::string      mClientName; //< Target machine forward to
     std::string      mTargetHost;
-    uint16_t         mTargetPort;
+    std::uint16_t         mTargetPort;
 
     // State
     std::stop_source mStopSource; //< Used to stop whole rule
@@ -61,7 +58,7 @@ public:
         using Ptr = std::shared_ptr<Tunnel>;
 
         // The send window
-        size_t sendWindow = HAJIMI_INIT_WINDOW_SIZE;
+        std::size_t sendWindow = HAJIMI_INIT_WINDOW_SIZE;
         ilias::Event sendWindowUpdated{ilias::Event::AutoClear};
         ilias::Event closed{}; //< Set when closed
 
@@ -107,9 +104,8 @@ public:
     auto rateWorker() -> IoTask<void>;
     auto readWorker(MessageReader &reader) -> IoTask<void>;
     auto writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void>;
-    auto tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::string host, uint16_t port) -> IoTask<void>;
+    auto tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::string host, std::uint16_t port) -> IoTask<void>;
 };
-
 
 // MARK: ProxyServer
 ProxyServer::ProxyServer(Config config) : mConfig(config) {
@@ -308,7 +304,6 @@ auto ProxyServer::status() const -> std::string {
     //     "duckdns": self.duckdns_updater.get_status() if self.duckdns_updater else None,
     // }
 
-
     return js.dump(0);
     // return js.dump(4);
 }
@@ -323,10 +318,10 @@ auto ProxyServer::addRule(std::string_view ruleJson) -> Result<void, std::string
     auto rule = json::parse(ruleJson);
 
     // {"listen_port":666,"client_name":"hajimi-client","target_host":"127.0.0.1","target_port":555}
-    auto listenPort = rule["listen_port"].get<uint16_t>();
+    auto listenPort = rule["listen_port"].get<std::uint16_t>();
     auto clientName=  rule["client_name"].get<std::string>();
     auto targetHost = rule["target_host"].get<std::string>();
-    auto targetPort = rule["target_port"].get<uint16_t>();
+    auto targetPort = rule["target_port"].get<std::uint16_t>();
     if (mRules.contains(listenPort)) {
         return ilias::Err("Port already used");
     }
@@ -363,7 +358,7 @@ auto ProxyServer::removeRule(std::string_view ruleJson) -> Result<void, std::str
     // {"listen_port":666}
     using nlohmann::json;
 
-    auto port = json::parse(ruleJson)["listen_port"].get<uint16_t>();
+    auto port = json::parse(ruleJson)["listen_port"].get<std::uint16_t>();
     auto it = mRules.find(port);
     if (it == mRules.end()) {
         return ilias::Err("Rule not found");
@@ -490,7 +485,7 @@ auto ClientSession::rateWorker() -> IoTask<void> {
     co_return {};
 }
 
-auto ClientSession::tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::string host, uint16_t port) -> IoTask<void> {
+auto ClientSession::tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::string host, std::uint16_t port) -> IoTask<void> {
     // Alloc streamId
     auto streamId = ++mStreamId;
     std::println("[ClientSession] {} request to open tunnel to {}:{}", mName, host, port);
@@ -553,7 +548,7 @@ auto ClientSession::tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::
         co_return {};
     };
     auto writeCopyWorker = [&]() -> IoTask<void> {
-        size_t peerSum = 0;
+        std::size_t peerSum = 0;
         while (auto bytes = co_await receiver.recv()) {
             // Send bytes to local stream
             // std::println("[ProxyServer] Tunnel '{}' write {} bytes data to local", streamId, bytes->size());
@@ -567,7 +562,7 @@ auto ClientSession::tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::
             }
             auto _ = mMessageSender.trySend(WindowUpdate {
                 .streamId = streamId,
-                .size = static_cast<uint32_t>(peerSum)
+                .size = static_cast<std::uint32_t>(peerSum)
             });
             peerSum = 0;
         }

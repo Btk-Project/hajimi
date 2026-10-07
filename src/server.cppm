@@ -1,23 +1,7 @@
-#pragma once
-
-#include <ilias/task.hpp>
-#include <ilias/net.hpp>
-#include <ilias/io.hpp>
-
-#include <optional>
-#include <string>
-#include <chrono>
-#include <memory>
-#include <map>
-
-#include "duckdns.hpp"
-
-// Import
-using ilias::IPEndpoint;
-using ilias::TcpStream;
-using ilias::BufStream;
-using ilias::IoTask;
-using ilias::Result;
+export module hajimi.server;
+import hajimi.duckdns;
+import ilias;
+import std;
 
 // Forward
 class ClientSession;
@@ -27,11 +11,11 @@ class ProxyRule;
  * @brief The Proxy server 
  * 
  */
-class ProxyServer {
+export class ProxyServer {
 public:
     struct Config {
-        IPEndpoint listen; // Bind on which address
-        IPEndpoint webui; // The webui address
+        ilias::IPEndpoint listen; // Bind on which address
+        ilias::IPEndpoint webui; // The webui address
         
         // DuckDns
         std::string duckdnsDomain;
@@ -45,9 +29,9 @@ public:
     /**
      * @brief Start the server
      * 
-     * @return IoTask<void> 
+     * @return ilias::IoTask<void> 
      */
-    auto run() -> IoTask<void>;
+    auto run() -> ilias::IoTask<void>;
 
     // Must call in durling the run
     /**
@@ -61,19 +45,19 @@ public:
      * @brief Add an rule
      * 
      * @param json The json string of the request
-     * @return Result<void, std::string> 
+     * @return ilias::Result<void, std::string> 
      */
-    auto addRule(std::string_view json) -> Result<void, std::string>;
+    auto addRule(std::string_view json) -> ilias::Result<void, std::string>;
 
     /**
      * @brief Remove an rule
      * 
      * @param json The json string of the request
-     * @return Result<void, std::string> 
+     * @return ilias::Result<void, std::string> 
      */
-    auto removeRule(std::string_view json) -> Result<void, std::string>;
+    auto removeRule(std::string_view json) -> ilias::Result<void, std::string>;
 private:
-    auto handleSession(TcpStream stream) -> IoTask<void>;
+    auto handleSession(ilias::TcpStream stream) -> ilias::IoTask<void>;
 
     Config mConfig;
     ilias::TaskScope *mScope = nullptr;

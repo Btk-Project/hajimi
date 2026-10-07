@@ -1,27 +1,18 @@
-#include <nlohmann/json.hpp>
 #include <ilias/macros.hpp>
-#include <ilias/task.hpp>
-#include <ilias/net.hpp>
-#include <ilias/io.hpp>
-#include <ranges>
-#include <string>
-#include <format>
-#include <print>
-#include "server.hpp"
-#include "web.hpp"
 
-// Import types
-using ilias::TcpListener;
-using ilias::TcpStream;
-using ilias::BufStream;
-using ilias::TaskScope;
-using ilias::Task;
+module hajimi.web;
+import hajimi.json;
+import ilias;
+import std;
 
-// Static
 extern "C" {
     extern const char _binary_index_html_start[];
     extern const char _binary_index_html_end[];
 }
+
+// Import types
+using namespace ilias;
+using nlohmann::json;
 
 // Impl
 WebUi::WebUi(ProxyServer &server, IPEndpoint endpoint) : mServer(server), mEndpoint(endpoint) {
@@ -75,7 +66,7 @@ auto WebUi::handleIncoming(Stream stream) -> IoTask<void> {
 
         // Parse the headers
         std::string content;
-        std::optional<size_t> contentLength;
+        std::optional<std::size_t> contentLength;
         while (true) {
             ILIAS_CO_TRY(line, co_await stream.getline("\r\n"));
             if (line.empty()) {
@@ -86,7 +77,7 @@ auto WebUi::handleIncoming(Stream stream) -> IoTask<void> {
             }
             else if (line.starts_with("Content-Length: ")) {
                 auto numStr = std::string_view{line}.substr(16);
-                auto len = size_t{0};
+                auto len = std::size_t{0};
                 if (std::from_chars(numStr.data(), numStr.data() + numStr.size(), len).ec != std::errc{}) {
                     break;
                 }

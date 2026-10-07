@@ -1,12 +1,9 @@
-#include <ilias/task.hpp>
-#include <ilias/net.hpp>
+#include <ilias/macros.hpp>
 
-#include <chrono>
-#include <format>
-#include <print>
-
-#include "duckdns.hpp"
-#include "utils.hpp"
+module hajimi.duckdns;
+import std;
+import ilias;
+import hajimi.utils;
 
 using ilias::Task;
 using ilias::IoTask;

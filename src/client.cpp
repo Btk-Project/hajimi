@@ -1,26 +1,20 @@
+module;
 #include <ilias/macros.hpp>
-#include <ilias/sync.hpp>
-#include <ilias/task.hpp>
-#include <ilias/net.hpp>
-#include <ilias/io.hpp>
 
-#include <memory_resource>
-#include <chrono>
-#include <print>
-#include <map>
+module hajimi.client;
+import std;
+import ilias;
+import hajimi.protocol;
+import hajimi.skbuf;
+import hajimi.utils;
 
-#include "protocol.hpp"
-#include "client.hpp"
-#include "skbuf.hpp"
-#include "utils.hpp"
-
+using ilias::IoTask;
 // Import types
 using ilias::ReadableView;
 using ilias::WritableView;
 using ilias::Buffer;
 using ilias::TaskScope;
 using ilias::Task;
-
 
 // Internal state of the client
 class ClientState {
@@ -30,7 +24,7 @@ public:
         using Ptr = std::shared_ptr<Tunnel>;
 
         // The send window
-        size_t sendWindow = HAJIMI_INIT_WINDOW_SIZE;
+        std::size_t sendWindow = HAJIMI_INIT_WINDOW_SIZE;
         ilias::Event sendWindowUpdated{ilias::Event::AutoClear};
         ilias::Event closed{}; //< Set when closed
 
@@ -46,7 +40,7 @@ public:
     TaskScope *mScope = nullptr;
 
     // Tunnel
-    std::map<uint64_t, Tunnel::Ptr> mTunnels;
+    std::map<std::uint64_t, Tunnel::Ptr> mTunnels;
 
     // For posting message to write worker
     ilias::mpsc::Sender<Message> mMessageSender;
@@ -57,9 +51,8 @@ public:
     // Workers
     auto readWorker(MessageReader &reader) -> IoTask<void>;
     auto writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void>;
-    auto tunnelWorker(uint64_t streamId, std::string endpoint, Tunnel::Ptr tunnel) -> IoTask<void>;
+    auto tunnelWorker(std::uint64_t streamId, std::string endpoint, Tunnel::Ptr tunnel) -> IoTask<void>;
 };
-
 
 // MARK: Impl
 ProxyClient::ProxyClient(Config config) : mConfig(config) {
@@ -210,7 +203,7 @@ auto ClientState::writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Messa
     co_return {};
 }
 
-auto ClientState::tunnelWorker(uint64_t streamId, std::string endpoint, Tunnel::Ptr tunnel) -> IoTask<void> {
+auto ClientState::tunnelWorker(std::uint64_t streamId, std::string endpoint, Tunnel::Ptr tunnel) -> IoTask<void> {
     std::println("[ProxyClient] OpenTunnel '{}' => {}", streamId, endpoint);
     
     // Prepare cleanup
@@ -254,7 +247,7 @@ auto ClientState::tunnelWorker(uint64_t streamId, std::string endpoint, Tunnel::
         co_return {};
     };
     auto writeCopyWorker = [&]() -> IoTask<void> {
-        size_t peerSum = 0;
+        std::size_t peerSum = 0;
         while (auto bytes = co_await tunnel->bytesReceiver.recv()) {
             // Send bytes to local stream
             // std::println("[ClientState] Tunnel '{}' write {} bytes data to local", streamId, bytes->size());
@@ -268,7 +261,7 @@ auto ClientState::tunnelWorker(uint64_t streamId, std::string endpoint, Tunnel::
             }
             auto _ = mMessageSender.trySend(WindowUpdate {
                 .streamId = streamId,
-                .size = static_cast<uint32_t>(peerSum)
+                .size = static_cast<std::uint32_t>(peerSum)
             });
             peerSum = 0;
         }

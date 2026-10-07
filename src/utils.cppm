@@ -1,27 +1,23 @@
-#pragma once
+export module hajimi.utils;
 
-#include <ilias/task.hpp>
-#include <ilias/net.hpp>
-#include <ilias/io.hpp>
+import ilias;
+import std;
 
-#include <algorithm>
-#include <vector>
-#include <print>
-
-// ScopeExit
-template <typename Fn>
+// Scope Exit helper
+export template <typename Fn>
 class ScopeExit {
 public:
-    ScopeExit(Fn fn) : mFn(fn) {}
-    ~ScopeExit() { mFn(); }
+    inline ScopeExit(Fn fn) : mFn(fn) {}
+    inline ~ScopeExit() { mFn(); }
 private:
     Fn mFn;
 };
 
-// Use HE2.0
+
+// HE2
 namespace happy_eyeballs {
 
-inline auto connect(std::vector<ilias::IPEndpoint> endpoints) -> ilias::IoTask<ilias::TcpStream> {
+export auto connect(std::vector<ilias::IPEndpoint> endpoints) -> ilias::IoTask<ilias::TcpStream> {
     using namespace std::chrono_literals;
     using namespace ilias;
 
@@ -29,7 +25,7 @@ inline auto connect(std::vector<ilias::IPEndpoint> endpoints) -> ilias::IoTask<i
     auto newEnd = std::unique(endpoints.begin(), endpoints.end());
     endpoints.erase(newEnd, endpoints.end());
 
-#if __cpp_lib_format_ranges
+#if defined(__cpp_lib_format_ranges)
     std::println("[HE2] Connect {}", endpoints);
 #endif // __cpp_lib_format_ranges
 
@@ -57,4 +53,4 @@ inline auto connect(std::vector<ilias::IPEndpoint> endpoints) -> ilias::IoTask<i
     co_return ilias::Err(errc);
 }
 
-} // happy_eyeballs
+} // namespace happy_eyeballs

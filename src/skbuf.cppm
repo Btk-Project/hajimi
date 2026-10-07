@@ -1,5 +1,5 @@
 /**
- * @file skbuf.hpp
+ * @file skbuf.cppm
  * @author BusyStudent (fyw90mc@gmail.com)
  * @brief Common utils for handling buffer for socket
  * @version 0.1
@@ -8,30 +8,16 @@
  * @copyright Copyright (c) 2026
  * 
  */
-#pragma once
+module;
 
-// Common typedef 
-#include <initializer_list>
-#include <memory_resource> // pmr::memory_resource
-#include <algorithm> // ranges::sort
-#include <concepts> // integral
-#include <optional> // optional
-#include <utility> // in_range
 #include <cassert> // assert
-#include <cstddef> // size_t
-#include <cstring> // memcpy
-#include <cstdint> // uint32_t
-#include <memory> // unique_ptr
-#include <string> // string
-#include <vector>
-#include <array>
-#include <span> // span
-#include <new>
-#include <bit>
+
+export module hajimi.skbuf;
+import std;
 
 // Forward declarations
-class SkBufferPool;
-class SkBuffer;
+export class SkBufferPool;
+export class SkBuffer;
 
 /**
  * @brief The node of the socket buffer | Node | Storage { HeadRoom, Data, TailRoom } | 
@@ -52,7 +38,7 @@ public:
 
     // Storage
     // std::byte     storage[];
-    auto storage() -> std::byte * {
+    inline auto storage() -> std::byte * {
         return reinterpret_cast<std::byte *>(this) + sizeof(SkBufferNode);
     }
 };
@@ -66,7 +52,7 @@ public:
  *   | Node+Buf| Node+Buf| Node+Buf| Node+Buf|
  *   +---------+---------+---------+---------+
  */
-class SkBufferPool {
+export class SkBufferPool {
 public:
     /**
      * @brief The configuration of the buffer pool
@@ -83,7 +69,7 @@ public:
      * @param configs
      * @param upstream 
      */
-    explicit SkBufferPool(std::initializer_list<ClassInfo> configs, std::pmr::memory_resource *upstream = std::pmr::get_default_resource()) : 
+    inline explicit SkBufferPool(std::initializer_list<ClassInfo> configs, std::pmr::memory_resource *upstream = std::pmr::get_default_resource()) : 
         mUpstream(upstream), 
         mClasses(upstream)
     {
@@ -109,10 +95,10 @@ public:
     }
 
     // No copy and move
-    SkBufferPool(const SkBufferPool &) = delete;
-    SkBufferPool(SkBufferPool &&) = delete;
+    inline SkBufferPool(const SkBufferPool &) = delete;
+    inline SkBufferPool(SkBufferPool &&) = delete;
 
-    ~SkBufferPool() {
+    inline ~SkBufferPool() {
         static_assert(std::is_trivially_destructible_v<SkBufferNode>, "SkBufferNode is not trivially destructible");
         assert(mBuffers == 0 && "Some buffers are not deallocated");
         for (auto &class_ : mClasses) {
@@ -129,13 +115,13 @@ public:
      * @return SkBuffer 
      */
     [[nodiscard]]
-    auto allocate(std::size_t capacity) -> SkBuffer;
+    inline auto allocate(std::size_t capacity) -> SkBuffer;
 
     // Deallocate the buffer to the pool
-    auto deallocate(SkBufferNode *node) -> void;
+    inline auto deallocate(SkBufferNode *node) -> void;
 private:
     // Add a big slab to the class and split into blocks
-    auto refill(std::uint8_t classIdx) -> void;
+    inline auto refill(std::uint8_t classIdx) -> void;
 
     // The whole memory block allocate from upstream
     struct Slab {
@@ -169,41 +155,41 @@ private:
  * 
  * @note The buffer is not MT-Safe, use it at single thread
  */
-class SkBuffer {
+export class SkBuffer {
 public:
-    SkBuffer(SkBuffer &&) noexcept = default;
-    SkBuffer() = default;
+    inline SkBuffer(SkBuffer &&) noexcept = default;
+    inline SkBuffer() = default;
 
     // Check the buffer is unique?
     [[nodiscard]]
-    auto unique() const -> bool {
+    inline auto unique() const -> bool {
         if (!mBuffer) return false;
         return mBuffer->refcount == 1;
     }
 
     // Check the buffer is empty?
     [[nodiscard]]
-    auto empty() const -> bool {
+    inline auto empty() const -> bool {
         return size() == 0;
     }
 
     // Get the data size of the buffer
     [[nodiscard]]
-    auto size() const -> std::size_t {
+    inline auto size() const -> std::size_t {
         if (!mBuffer) return 0;
         return mTail - mHead;
     }
 
     // Get the data begin of the buffer
     [[nodiscard]]
-    auto data() const -> std::span<const std::byte> {
+    inline auto data() const -> std::span<const std::byte> {
         if (!mBuffer) return {};
         return {mBuffer->storage() + mHead, size()};
     }
 
     // Get the mutable data begin of the buffer
     [[nodiscard]]
-    auto mutableData() -> std::span<std::byte> {
+    inline auto mutableData() -> std::span<std::byte> {
         if (!mBuffer) return {};
         assert(unique() && "Buffer is not unique, Please cow before get data");
         return {mBuffer->storage() + mHead, size()};
@@ -211,69 +197,68 @@ public:
 
     // Get the whole capacity of the buffer
     [[nodiscard]]
-    auto capacity() const -> std::size_t {
+    inline auto capacity() const -> std::size_t {
         if (!mBuffer) return 0;
         return mBuffer->capacity;
     }
 
     // Get the num of bytes that can be prepend to the buffer
     [[nodiscard]]
-    auto headroom() const -> std::size_t {
+    inline auto headroom() const -> std::size_t {
         if (!mBuffer) return 0;
         return mHead;
     }
 
     // Get the num of bytes that can be append to the buffer
     [[nodiscard]]
-    auto tailroom() const -> std::size_t {
+    inline auto tailroom() const -> std::size_t {
         if (!mBuffer) return 0;
         return mBuffer->capacity - mTail;
     }
 
     // Get the buffer pool
     [[nodiscard]]
-    auto pool() const -> SkBufferPool * {
+    inline auto pool() const -> SkBufferPool * {
         return mBuffer ? &mBuffer->pool : nullptr;
     }
-
 
     // Prepare and commit the buffer
     // Back
     [[nodiscard]]
-    auto prepareBack(std::size_t size) -> std::span<std::byte> {
+    inline auto prepareBack(std::size_t size) -> std::span<std::byte> {
         assert(mBuffer && "Buffer is not allocated");
         assert(size <= tailroom() && "Buffer is overflow");
         assert(unique() && "Buffer is not unique, Please makeWritable() before preapreBack");
         return {mBuffer->storage() + mTail, size};
     }
 
-    auto commitBack(std::size_t size) -> void {
+    inline auto commitBack(std::size_t size) -> void {
         assert(mBuffer && "Buffer is not allocated");
         assert(size <= tailroom() && "Buffer is overflow");
         mTail += size;
     }
 
-    auto consumeBack(std::size_t size) -> void {
+    inline auto consumeBack(std::size_t size) -> void {
         assert(mBuffer && "Buffer is not allocated");
         assert(size <= this->size() && "Buffer is overflow");
         mTail -= size;
     }
 
     // Front
-    auto consumeFront(std::size_t size) -> void {
+    inline auto consumeFront(std::size_t size) -> void {
         assert(mBuffer && "Buffer is not allocated");
         assert(size <= this->size() && "Buffer is overflow");
         mHead += size;
     }
 
     // Clear the buffer to empty
-    auto clear() -> void {
+    inline auto clear() -> void {
         mHead = 0;
         mTail = 0;
     }
 
     // Reserve the number of bytes that can be prepend to the buffer, only can be called when buffer is empty
-    auto reserveHead(std::size_t headroom) -> void {
+    inline auto reserveHead(std::size_t headroom) -> void {
         assert(mBuffer && "Buffer is not allocated");
         assert(headroom <= mBuffer->capacity && "Buffer is overflow");
         assert(empty() && "reserve can only be called when buffer is empty");
@@ -283,7 +268,7 @@ public:
 
     // Utils
     // Append datas to the buffer back
-    auto append(std::span<const std::byte> data) -> void {
+    inline auto append(std::span<const std::byte> data) -> void {
         if (data.empty()) return;
         auto buf = prepareBack(data.size());
         std::memcpy(buf.data(), data.data(), data.size());
@@ -291,13 +276,13 @@ public:
     }
 
     // Append a string to the back of the buffer
-    auto appendString(std::string_view str) -> void {
+    inline auto appendString(std::string_view str) -> void {
         append(std::as_bytes(std::span{str}));
     }
 
     // Append a int to the back of the buffer, converted as be
     template <std::integral T>
-    auto appendIntBE(T val) -> void {
+    inline auto appendIntBE(T val) -> void {
         if (std::endian::native != std::endian::big) {
             val = std::byteswap(val);
         }
@@ -305,7 +290,7 @@ public:
     }
     
     // Append datas to the buffer front
-    auto prepend(std::span<const std::byte> data) -> void {
+    inline auto prepend(std::span<const std::byte> data) -> void {
         assert(mBuffer && "Buffer is not allocated");
         assert(mHead >= data.size() && "Buffer is overflow");
         assert(unique() && "Buffer is not unique, Please makeWritable() before prepend");
@@ -314,7 +299,7 @@ public:
     }
 
     template <std::integral T>
-    auto prependIntBE(T val) -> void {
+    inline auto prependIntBE(T val) -> void {
         if (std::endian::native != std::endian::big) {
             val = std::byteswap(val);
         }
@@ -324,7 +309,7 @@ public:
     // Pop data from the front of the buffer
     template <std::integral T>
     [[nodiscard]]
-    auto popIntBE() -> std::optional<T> {
+    inline auto popIntBE() -> std::optional<T> {
         auto buf = data();
         if (buf.size() < sizeof(T)) return std::nullopt;
 
@@ -340,7 +325,7 @@ public:
 
     // Pop string from the front of the buffer
     [[nodiscard]]
-    auto popString(std::size_t size) -> std::optional<std::string> {
+    inline auto popString(std::size_t size) -> std::optional<std::string> {
         if (!mBuffer || this->size() < size) return std::nullopt;
         auto buf = data();
         std::string str{reinterpret_cast<const char *>(buf.data()), size};
@@ -350,12 +335,12 @@ public:
 
     // Pop string from the whole buffer
     [[nodiscard]]
-    auto popString() -> std::optional<std::string> {
+    inline auto popString() -> std::optional<std::string> {
         return popString(size());
     }
 
     // Swap
-    auto swap(SkBuffer &other) noexcept -> void {
+    inline auto swap(SkBuffer &other) noexcept -> void {
         std::swap(mBuffer, other.mBuffer);
         std::swap(mHead, other.mHead);
         std::swap(mTail, other.mTail);
@@ -363,7 +348,7 @@ public:
 
     // Clone, add an refcount to it
     [[nodiscard]]
-    auto clone() const -> SkBuffer {
+    inline auto clone() const -> SkBuffer {
         if (!mBuffer) return {};
         mBuffer->refcount += 1;
         return SkBuffer {
@@ -375,7 +360,7 @@ public:
 
     // Slice the buffer
     [[nodiscard]]
-    auto slice(std::size_t offset, std::size_t len) const -> SkBuffer {
+    inline auto slice(std::size_t offset, std::size_t len) const -> SkBuffer {
         assert(offset <= size() && "Offset is overflow");
         assert(len <= size() - offset && "Length is overflow");
 
@@ -386,7 +371,7 @@ public:
     }
 
     // Move all data to the position after the given headroom
-    auto compact(std::size_t headroom = 0) -> void {
+    inline auto compact(std::size_t headroom = 0) -> void {
         assert(mBuffer && "Buffer is not allocated");
         assert(unique() && "Buffer is not unique, Please makeWritable() before compact");
 
@@ -406,7 +391,7 @@ public:
     }
 
     // Make the buffer writable, doing cow
-    auto makeWritable() -> void {
+    inline auto makeWritable() -> void {
         if (!mBuffer || unique()) return;
 
         // Allocate same capacity
@@ -420,16 +405,16 @@ public:
     
 
     // Operator
-    auto operator =(SkBuffer &&) noexcept -> SkBuffer & = default;
-    auto operator ==(const SkBuffer &) const -> bool = delete; // Compare the data by yourself
+    inline auto operator =(SkBuffer &&) noexcept -> SkBuffer & = default;
+    inline auto operator ==(const SkBuffer &) const -> bool = delete; // Compare the data by yourself
 
     // Check the buffer is valid?
     [[nodiscard]]
-    explicit operator bool() const noexcept {
+    inline explicit operator bool() const noexcept {
         return static_cast<bool>(mBuffer);
     }
 private:
-    explicit SkBuffer(SkBufferNode *node, std::uint32_t head = 0, std::uint32_t tail = 0) : mBuffer(node), mHead(head), mTail(tail) {}
+    inline explicit SkBuffer(SkBufferNode *node, std::uint32_t head = 0, std::uint32_t tail = 0) : mBuffer(node), mHead(head), mTail(tail) {}
 
     struct Deleter {
         auto operator()(SkBufferNode *node) -> void {
@@ -445,7 +430,6 @@ private:
     std::uint32_t mTail = 0; // The tail of the buffer
 friend class SkBufferPool;
 };
-
 
 // MARK: SkBufferPool Impl
 inline auto SkBufferPool::allocate(std::size_t capacity) -> SkBuffer {
