@@ -1,23 +1,27 @@
-# Hajimi - 轻量级 Python Asyncio 网络反向代理
+# Hajimi - 轻量级 C++ 内网穿透 / 反向代理
 
-基于 Python 标准库 `asyncio` 实现的零外部依赖反向代理系统，支持内网穿透、WebUI 可视化管理与动态端口转发。
+基于 C++23 协程与 ilias 异步运行时实现的反向代理工具，支持内网穿透、WebUI 可视化管理、动态端口转发与 DuckDNS 动态域名。
 
 ## 🌟 特性
-- **零第三方依赖 (Zero External Dependencies)**：纯 Python 3.8+ 标准库编写，无需 `pip install` 任何包。
-- **DuckDNS 动态域名自动同步 (DDNS Support)**：
-  - 服务端支持绑定 DuckDNS，定期自动更新公网 IP。
-  - **智能协议匹配**：绑定 IPv4 时仅更新 IPv4 (A 记录)；绑定 IPv6 时自动检测并仅更新 IPv6 (AAAA 记录)；双栈时两者均更新。
-  - Web 控制台实时显示 DuckDNS 同步状态与 IP。
-- **域名连接与解析**：客户端原生支持直接连接域名（如 `xxx.duckdns.org:8000`），内置 DNS 解析与自动重连。
-- **独立/复用 WebUI 自由配置**：
-  - 默认单端口多路复用：一个端口同时搞定控制流、桥接通道与 WebUI。
-  - 支持 `--webui "ip:port"` 指定独立管理端口，方便分离公网暴露端口与内网管理面板。
-- **原生 IPv6 / 双栈支持 (Full IPv6 & Dual-Stack Support)**：
-  - 支持 `[::]:8000`、`::1`、`fe80::...` 等 IPv6 格式。
-  - 代理转发端口默认绑定双栈（`host=None`），同时允许 IPv4 与 IPv6 访客连接。
-  - 支持将流量转发到客户端本地的 IPv6 服务（如 `::1:1145`）。
-- **WebUI 可视化控制台**：浏览器直接访问 Web 端口即可查看在线客户端列表、动态新增/停止反向代理端口规则。
-- **高并发与健壮性**：客户端内置自动断线重连与心跳保活机制，数据传输采用双向异步流管道中继。
+- **单连接多路复用**：客户端与服务端之间仅一条 TCP 长连接，控制消息与所有隧道数据通过 `streamId` 复用。
+- **隧道级流控**：每条隧道独立发送窗口（初始 128KB）+ `WindowUpdate`，慢连接不会拖垮其他隧道。
+- **零拷贝友好的缓冲区**：仿 `sk_buff` 的分级内存池 `SkBuffer`，预留 headroom 直接拼帧头。
+- **WebUI 控制台**：查看在线客户端、延迟、实时上下行速率，动态新增 / 删除转发规则；页面编译进可执行文件。
+- **DuckDNS 自动更新**：定期更新域名记录，IPv4 由 DuckDNS 自动识别，探测到公网 IPv6 时一并更新。
+- **IPv6 / 双栈**：转发端口默认监听 `[::]`；客户端连接支持域名、IPv4、`[ipv6]:port`，并采用 Happy Eyeballs 方式多地址连接。
+- **健壮性**：客户端断线自动重连（退避 2s → 15s，每次重连重新解析 DNS），服务端 30s 心跳检测。
+
+---
+
+## 🔨 构建
+
+依赖 [xmake](https://xmake.io) 与支持 C++23 的编译器，第三方库（ilias、nlohmann_json、argparse）由 xmake 自动拉取。
+
+```bash
+xmake f -m release
+xmake
+# 产物: build/<plat>/<arch>/release/hajimi
+```
 
 ---
 
@@ -25,53 +29,62 @@
 
 ### 1. 启动服务端 (Server)
 
-**模式 A：单端口复用**
 ```bash
-python main.py --listen "0.0.0.0:8000"
-# WebUI 直接访问: http://127.0.0.1:8000
+# WebUI 默认监听 127.0.0.1 的随机端口，实际端口见启动日志 "[WebUi] listen on ..."
+hajimi --listen "0.0.0.0:8000"
+
+# 指定 WebUI 地址
+hajimi --listen "0.0.0.0:8000" --webui "127.0.0.1:9000"
 ```
 
-**模式 B：启用 DuckDNS 动态域名自动更新**
+**启用 DuckDNS：**
 ```bash
-# 绑定 IPv4 时更新 IPv4:
-python main.py --listen "0.0.0.0:8000" --duckdns "myhome:a7c4d0ad-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+hajimi --listen "[::]:8000" --duckdns "myhome:a7c4d0ad-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
-# 绑定 IPv6 时更新 IPv6:
-python main.py --listen "[::]:8000" --duckdns-domain "myhome" --duckdns-token "a7c4d0ad-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-```
-
-**模式 C：独立 WebUI 端口**
-```bash
-python main.py --listen "0.0.0.0:8000" --webui "0.0.0.0:9000"
-# WebUI 访问: http://127.0.0.1:9000
+# 或分开指定，并修改更新间隔（秒，默认 300）
+hajimi --listen "[::]:8000" --duckdns-domain "myhome" --duckdns-token "a7c4d0ad-..." --duckdns-interval 600
 ```
 
 ### 2. 启动内网客户端 (Client)
-客户端支持连接到 IP 或 DuckDNS 域名：
-```bash
-# 连接到 DuckDNS 域名:
-python main.py --connect "myhome.duckdns.org:8000" --name "mypc"
 
-# 连接到 IP (IPv4 或 IPv6):
-python main.py --connect "1.2.3.4:8000" --name "mypc"
-python main.py --connect "[2001:db8::1]:8000" --name "mypc"
+```bash
+hajimi --connect "myhome.duckdns.org:8000" --name "mypc"
+hajimi --connect "1.2.3.4:8000" --name "mypc"
+hajimi --connect "[2001:db8::1]:8000" --name "mypc"
 ```
-> 注：支持 `domain:port`、`domain::port` 与 `[ipv6]:port` 等多种写法，客户端名称支持引号包裹。
+> `--name` 默认为 `hajimi-client`，同名客户端只能同时在线一个。
 
 ### 3. 配置反向代理转发
-在服务端 Web 控制台界面：
-1. **服务端监听端口 (Listen Port)**：输入希望在服务端对外开放的端口，如 `666`。
-2. **目标客户端 (Target Client)**：下拉选择已上线的客户端，如 `mypc`。
-3. **客户端内网地址**：默认 `127.0.0.1`。
-4. **客户端目标端口 (Target Port)**：输入客户端本地服务端口，如 `1145`。
-5. 点击 **“启动代理”**。
 
-此时，访问服务端 `server_ip:666` 的所有 TCP 流量将被自动、透明地穿透转发到客户端 `mypc` 的本地 `1145` 端口上！
+打开 WebUI，填写：
+1. **服务端监听端口**：服务端对外开放的端口，如 `666`
+2. **目标客户端**：已上线的客户端，如 `mypc`
+3. **客户端内网地址**：默认 `127.0.0.1`
+4. **客户端目标端口**：客户端本地服务端口，如 `1145`
+
+之后访问 `server_ip:666` 的 TCP 流量会被转发到 `mypc` 的 `127.0.0.1:1145`。
+
+也可以直接调用 HTTP API：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/status` | 服务端状态、客户端、规则、DuckDNS 信息 |
+| `POST` | `/api/rules` | 新增规则 `{"listen_port":666,"client_name":"mypc","target_host":"127.0.0.1","target_port":1145}` |
+| `DELETE` | `/api/rules` | 删除规则 `{"listen_port":666}` |
+
+> ⚠️ WebUI 无鉴权，请勿暴露到公网。
 
 ---
 
-## 🧪 运行测试
-执行自动化集成测试脚本：
-```bash
-python test_proxy.py
-```
+## 📁 项目结构
+
+| 文件 | 说明 |
+|---|---|
+| `src/main.cpp` | 命令行入口 |
+| `src/protocol.hpp` | 线协议：`u16 长度 + u8 类型 + payload` |
+| `src/skbuf.hpp` | Socket 缓冲区与内存池 |
+| `src/server.cpp` | 服务端：会话管理、转发规则、隧道 |
+| `src/client.cpp` | 客户端：注册、重连、本地转发 |
+| `src/web.cpp` / `static/index.html` | WebUI 与 HTTP API |
+| `src/duckdns.cpp` | DuckDNS 更新 |
+| `src/utils.hpp` | ScopeExit、Happy Eyeballs 连接 |

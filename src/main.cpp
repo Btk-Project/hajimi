@@ -12,7 +12,7 @@
 int ilias_main(int argc, char **argv) try {
     argparse::ArgumentParser parser{"hajimi"};
 
-    parser.add_description("Hajimi - Asyncio Reverse Proxy");
+    parser.add_description("Hajimi - Asyncio Reverse Proxy, ilias runtime version: " ILIAS_VERSION_STRING);
 
     // Server options
     parser.add_argument("--listen")

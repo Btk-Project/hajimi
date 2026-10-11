@@ -39,22 +39,35 @@ inline auto connect(std::vector<ilias::IPEndpoint> endpoints) -> ilias::IoTask<i
 
     // TODO: Impl real HE2.0
     TaskGroup<IoResult<TcpStream> > group;
-    for (auto &endpoint : endpoints) {
-        group.spawn(TcpStream::connect(endpoint));
+    std::error_code lastErr;
+
+    // Not all added
+    std::ranges::reverse(endpoints);
+
+    while (!endpoints.empty() || !group.empty()) {
+        if (!group.empty()) {
+            // Try wait 
+            auto res = co_await timeout(group.next(), 250ms);
+            if (res) { // Has result
+                auto &stream = res->value();
+                if (stream) { // Done
+                    std::println("[HE2] Connect OK, Using '{}'", stream->remoteEndpoint().value());
+                    co_await group.shutdown(); // Shutdown the another tasks
+                    co_return std::move(*stream);
+                }
+                std::println("[HE2] Connect failed by {}, {} pending, {} left", stream.error().message(), group.size(), endpoints.size());
+                lastErr = stream.error();
+            }
+        }
+        if (!endpoints.empty()) { // Start more
+            std::println("[HE2] Connect To '{}', {} pending, {} left", endpoints.back(), group.size(), endpoints.size() - 1);
+            group.spawn(TcpStream::connect(endpoints.back()));
+            endpoints.pop_back();
+        }
     }
 
-    std::error_code errc;
-    while (!group.empty()) {
-        auto res = (co_await group.next()).value(); // We are not cancel, just call .value()
-        if (res) {
-            std::println("[HE2] Connect OK");
-            co_return std::move(*res);
-        }
-        errc = res.error();
-    }
-    // All failed;
-    std::println("[HE2] Connect all failed {}", errc.message());
-    co_return ilias::Err(errc);
+    // All failed, none connected
+    co_return Err(lastErr);
 }
 
 } // happy_eyeballs
