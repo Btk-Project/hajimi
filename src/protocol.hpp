@@ -17,7 +17,7 @@
 
 // MARK: Protocol
 // Current used version (increase it of the protocol changes)
-constexpr auto HAJIMI_VERSION = uint16_t{0x2};
+constexpr auto HAJIMI_VERSION = uint16_t{0x3};
 
 // The header size 
 constexpr auto HAJIMI_HEADER = sizeof(uint16_t) + sizeof(uint8_t);
@@ -70,12 +70,12 @@ struct HelloAck {};
 struct Ping {};
 struct Pong {};
 
-// OpenTunnel from server
+// OpenTunnel between client <-> server
 // The tunnel is logical exist before the TunnelClose message
 // u64   streamId
 // u8 [] host:port
 struct OpenTunnel {
-    uint64_t streamId;
+    uint64_t streamId;    // Id of the tunnel (if server -> client, the id should be even, otherwise odd)
     std::string endpoint;
 };
 
@@ -169,6 +169,12 @@ public:
             [](const WindowUpdate &) { return MessageType::WindowUpdate; },
             [](const FatalError &) { return MessageType::FatalError; },
         }, mStorage);
+    }
+
+    // Visit the message
+    template <typename T>
+    auto visit(T &&visitor) {
+        return std::visit(std::forward<T>(visitor), mStorage);
     }
 
     // Operator

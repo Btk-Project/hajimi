@@ -11,20 +11,17 @@
 
 #include "protocol.hpp"
 #include "duckdns.hpp"
+#include "tunnel.hpp"
 #include "server.hpp"
 #include "utils.hpp"
 #include "web.hpp"
 
 using ilias::MutableBuffer;
 using ilias::TcpListener;
-using ilias::ReadableView;
-using ilias::WritableView;
-using ilias::StreamView;
 using ilias::IPEndpoint;
 using ilias::TaskScope;
 using ilias::Task;
 using ilias::Event;
-using ilias::Mutex;
 
 // The status of it
 class ProxyStatus final {
@@ -57,20 +54,7 @@ public:
 // The state of the client
 class ClientSession final {
 public:
-    struct Tunnel {
-        using Ptr = std::shared_ptr<Tunnel>;
-
-        // The send window
-        size_t sendWindow = HAJIMI_INIT_WINDOW_SIZE;
-        ilias::Event sendWindowUpdated{ilias::Event::AutoClear};
-        ilias::Event closed{}; //< Set when closed
-
-        // For sending the data frame
-        ilias::mpsc::Sender<SkBuffer> bytesSender;
-    };
-
-    // Scope
-    TaskScope  *mScope = nullptr;
+    using Ptr = std::shared_ptr<ClientSession>;
 
     // Client info
     std::string mName;
@@ -97,17 +81,14 @@ public:
 
     // Tunnels
     std::uint64_t mStreamId = 0; // Self increase
-    std::map<std::uint64_t, Tunnel::Ptr> mTunnels;
-
-    // Pool
-    SkBufferPool mPool{HAJIMI_POOL_CONFIG};
+    TunnelManager mTunnels;
 
     // Sub worker
     auto pingWorker() -> IoTask<void>;
     auto rateWorker() -> IoTask<void>;
     auto readWorker(MessageReader &reader) -> IoTask<void>;
     auto writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void>;
-    auto tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::string host, uint16_t port) -> IoTask<void>;
+    auto openTunnel(ProxyStatus::Ptr status, TcpStream local, std::string host, uint16_t port) -> void;
 };
 
 
@@ -163,61 +144,72 @@ auto ProxyServer::run() -> IoTask<void> {
 }
 
 auto ProxyServer::handleSession(TcpStream stream) -> IoTask<void> {
-    auto session = std::make_shared<ClientSession>();
-    MessageReader reader{stream, session->mPool};
-    MessageWriter writer{stream, session->mPool};
+    SkBufferPool pool{HAJIMI_POOL_CONFIG};
+    MessageReader reader{stream, pool};
+    MessageWriter writer{stream, pool};
 
-    co_return co_await TaskScope::enter([&](TaskScope &scope) -> IoTask<void> {
-        session->mScope = &scope;
-        // First, read and parse hello
-        Hello hello{};
-        {
-            ILIAS_CO_TRY(auto msg, co_await reader.readMessage());
-            ILIAS_CO_TRY(hello, msg.cast<Hello>());
-            if (hello.version != HAJIMI_VERSION) {
-                std::println("[ProxyServer] Unexpected version {}, expected {}", hello.version, HAJIMI_VERSION);
-                auto _ = co_await writer.writeMessage(FatalError {
-                    .msg = std::format("Version mismatch {}, expected: {}", hello.version, HAJIMI_VERSION)
-                });
-                co_return {};
+    // First, read and parse hello
+    Hello hello{};
+    {
+        ILIAS_CO_TRY(auto msg, co_await reader.readMessage());
+        ILIAS_CO_TRY(hello, msg.cast<Hello>());
+        if (hello.version != HAJIMI_VERSION) {
+            std::println("[ProxyServer] Unexpected version {}, expected {}", hello.version, HAJIMI_VERSION);
+            auto _ = co_await writer.writeMessage(FatalError {
+                .msg = std::format("Version mismatch {}, expected: {}", hello.version, HAJIMI_VERSION)
+            });
+            co_return {};
+        }
+    }
+
+    // Register it
+    auto [sender, receiver] = ilias::mpsc::channel<Message>(); // Unbound
+    TaskScope scope;
+    ClientSession::Ptr session {
+        new ClientSession { // Pin
+            .mName = hello.name,
+            .mRemoteEndpoint = stream.remoteEndpoint().value(),
+            .mConnectedAt = std::chrono::steady_clock::now(),
+            .mMessageSender = sender,
+            .mTunnels = TunnelManager {
+                scope,
+                pool,
+                sender,
             }
         }
-        // Register it
-        {
-            session->mName = hello.name;
-            session->mConnectedAt = std::chrono::steady_clock::now();
-            ILIAS_CO_TRY(session->mRemoteEndpoint, stream.remoteEndpoint());
+    };
 
-            // Try emplace
-            auto [it, emplace] = mSessions.emplace(hello.name, session);
-            if (!emplace) {
-                std::println("[ProxyServer] Failed to register '{}', already exists?", hello.name);
-                auto _ = co_await writer.writeMessage(FatalError { .msg = "Name already exists" });
-                co_return {};
-            }
+    {
+        // Try emplace
+        auto [it, emplace] = mSessions.emplace(hello.name, session);
+        if (!emplace) {
+            std::println("[ProxyServer] Failed to register '{}', already exists?", hello.name);
+            auto _ = co_await writer.writeMessage(FatalError { .msg = "Name already exists" });
+            co_return {};
         }
-        std::println("[ProxyServer] New Client '{}' from {}", hello.name, stream.remoteEndpoint().value());
+    }
+    std::println("[ProxyServer] New Client '{}' from {}", hello.name, stream.remoteEndpoint().value());
 
-        // Add RAII guard remove when disconnect
-        ScopeExit exit{[this, session, &scope]() {
-            std::println("[ProxyServer] Client '{}' disconnect", session->mName);
-            mSessions.erase(session->mName);
-            scope.stop();
-        }};
-        // Reply with Ack
-        ILIAS_CO_TRYV(co_await writer.writeMessage(HelloAck{}));
+    // Add RAII guard remove when disconnect
+    ScopeExit exit{[this, session, &scope]() {
+        std::println("[ProxyServer] Client '{}' disconnect", session->mName);
+        mSessions.erase(session->mName);
+        scope.stop();
+    }};
+    // Reply with Ack
+    ILIAS_CO_TRYV(co_await writer.writeMessage(HelloAck{}));
 
-        // Do the main loop
-        auto [sender, receiver] = ilias::mpsc::channel<Message>(); // Unbound
-        session->mMessageSender = sender;
-        auto _ = co_await ilias::whenAny(
+    // Do the main loop
+    auto _ = co_await ilias::whenAll(
+        ilias::whenAny(
             session->readWorker(reader),
             session->writeWorker(writer, std::move(receiver)),
             session->pingWorker(),
             session->rateWorker()
-        );
-        co_return {};
-    });
+        ),
+        scope.waitAll()
+    );
+    co_return {};
 }
 
 // Get the status
@@ -234,7 +226,6 @@ auto ProxyServer::status() const -> std::string {
         clients.push_back(json {
             {"name", name},
             {"remote_ip", client->mRemoteEndpoint.toString()},
-            {"connected_at", 0}, // TODO:
             {"uptime_seconds", duration_cast<seconds>(steady_clock::now() - client->mConnectedAt).count()},
             {"ping_ms", client->mLatencyMs},
             {"upload_speed", client->mUploadRate},
@@ -251,7 +242,6 @@ auto ProxyServer::status() const -> std::string {
     // "target_port": self.target_port,
     // "active_connections": self.active_connections,
     // "total_connections": self.total_connections,
-    // "created_at": int(self.created_at),
     auto rules = json::array();
     for (const auto &[port, rule] : mRules) {
         rules.push_back(json {
@@ -261,7 +251,6 @@ auto ProxyServer::status() const -> std::string {
             {"target_port", rule->mTargetPort},
             {"active_connections", rule->mStatus->activeConnections},
             {"total_connections", rule->mStatus->totalConnections},
-            {"created_at", 0} // TODO:
         });
     }
 
@@ -272,17 +261,14 @@ auto ProxyServer::status() const -> std::string {
     // "status": self.last_status,
     // "ipv4": self.last_ipv4,
     // "ipv6": self.last_ipv6,
-    // "interval_seconds": self.interval,
     auto duckdns = json{};
     if (mDuckDns) {
         duckdns = json {
             {"enabled", true},
             {"domain", std::format("{}.duckdns.org", mDuckDns->domain())},
-            {"last_update", 0}, // TODO:
             {"status", mDuckDns->status()},
             {"ipv4", mDuckDns->ipv4()},
             {"ipv6", mDuckDns->ipv6()},
-            {"interval_seconds", mDuckDns->interval().count()}
         };
     }
 
@@ -395,41 +381,20 @@ auto ClientSession::readWorker(MessageReader &reader) -> IoTask<void> {
             }
             case MessageType::DataExchange: {
                 ILIAS_CO_TRY(auto exchange, msg.cast<DataExchange>());
-                auto it = mTunnels.find(exchange.streamId);
-                if (it == mTunnels.end()) {
-                    std::println("[ClientSession] DataExchange for Tunnel '{}' not found", exchange.streamId);
-                    continue;
-                }
-                auto [streamId, tunnel] = *it;
                 // Count uploaded bytes from client
                 mUploadBytes += exchange.data.size();
-                // Copy the buffer into vector
-                auto _ = co_await tunnel->bytesSender.send(std::move(exchange.data));
+                mTunnels.onDataExchange(exchange.streamId, std::move(exchange.data));
                 continue;
             }
             case MessageType::WindowUpdate: {
                 ILIAS_CO_TRY(auto update, msg.cast<WindowUpdate>());
-                auto it = mTunnels.find(update.streamId);
-                if (it == mTunnels.end()) {
-                    std::println("[ClientSession] WindowUpdate for Tunnel '{}' not found", update.streamId);
-                    continue;
-                }
-                auto [streamId, tunnel] = *it;
-                tunnel->sendWindow += update.size;
-                tunnel->sendWindowUpdated.set();
+                mTunnels.onWindowUpdate(update.streamId, update.size);
                 continue;
             }
             case MessageType::TunnelClose: { 
                 // A tunnel was closed by peer, remove it
                 ILIAS_CO_TRY(auto close, msg.cast<TunnelClose>());
-                std::println("[ProxyServer] Tunnel {} was request to close by remote", close.streamId);
-                auto it = mTunnels.find(close.streamId);
-                if (it == mTunnels.end()) {
-                    continue;
-                }
-                auto [streamId, tunnel] = *it;
-                tunnel->closed.set();
-                mTunnels.erase(it);
+                mTunnels.closeTunnel(close.streamId);
                 continue;
             }
             case MessageType::FatalError: { // ERRROR!!!!!
@@ -447,6 +412,12 @@ auto ClientSession::readWorker(MessageReader &reader) -> IoTask<void> {
 
 auto ClientSession::writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void> {
     while (auto msg = co_await receiver.recv()) {
+        msg->visit(Overloads {
+            [&](const auto &_) {}, // Ignore
+            [&](const DataExchange &exchange) { // Count downloaded bytes from client
+                mDownloadBytes += exchange.data.size();
+            }
+        });
         ILIAS_CO_TRYV(co_await writer.writeMessage(std::move(*msg)));
     }
     co_return {};
@@ -490,96 +461,52 @@ auto ClientSession::rateWorker() -> IoTask<void> {
     co_return {};
 }
 
-auto ClientSession::tunnelWorker(ProxyStatus::Ptr status, TcpStream local, std::string host, uint16_t port) -> IoTask<void> {
+auto ClientSession::openTunnel(ProxyStatus::Ptr status, TcpStream local, std::string host, uint16_t port) -> void {
     // Alloc streamId
-    auto streamId = ++mStreamId;
+    auto streamId = mStreamId;
+    mStreamId += 2;
     std::println("[ClientSession] {} request to open tunnel to {}:{}", mName, host, port);
 
-    // Register it
-    auto [sender, receiver] = ilias::mpsc::channel<SkBuffer>();
-    Tunnel::Ptr tunnel {
-        new Tunnel { // In place
-            .bytesSender = std::move(sender),
-        }
-    };
-    mTunnels.emplace(streamId, tunnel);
-
-    // RAII guard to cleanup
-    status->activeConnections += 1;
-    status->totalConnections += 1;
-    ScopeExit exit{[this, streamId, status]() {
-        std::println("[ClientSession] Tunnel {} closed", streamId);
-        status->activeConnections -= 1;
-        if (mTunnels.contains(streamId)) { // The peer didn't send the closed, close it
-            mTunnels.erase(streamId);
-            auto _ = mMessageSender.trySend(TunnelClose {
-                .streamId = streamId
-            });
-        }
-    }};
-
-    // Open Tunnel
-    {
-        auto _ = mMessageSender.trySend(OpenTunnel {
-            .streamId = streamId,
-            .endpoint = host + ':' + std::to_string(port)
-        });
-    }
-
-    // Begin copy
-    auto readCopyWorker = [&]() -> IoTask<void> {
-        while (true) {
-            while (tunnel->sendWindow == 0) { // Waiting for the send window
-                co_await tunnel->sendWindowUpdated.wait();
-            }
-            auto bufsize = std::min(HAJIMI_MAX_DATA_EXCHANGE, tunnel->sendWindow);
-            auto skbuf = mPool.allocate(HAJIMI_HEADER_ROOM + bufsize);
-            skbuf.reserveHead(HAJIMI_HEADER_ROOM);
-
-            ILIAS_CO_TRY(auto n, co_await local.read(skbuf.prepareBack(bufsize)));
-            skbuf.commitBack(n);
-            if (n == 0) { // EOF
-                break;
-            }
-
-            auto _ = mMessageSender.trySend(DataExchange {
+    mTunnels.addTunnel(streamId, [this, streamId, status, local = std::move(local), host, port]() mutable -> IoTask<DynStream> {
+        // Send Open Tunnel to peer
+        {
+            auto _ = mMessageSender.trySend(OpenTunnel {
                 .streamId = streamId,
-                .data = std::move(skbuf)
+                .endpoint = host + ':' + std::to_string(port)
             });
-            // Count downloaded bytes for client
-            mDownloadBytes += n;
-            tunnel->sendWindow -= n;
         }
-        co_return {};
-    };
-    auto writeCopyWorker = [&]() -> IoTask<void> {
-        size_t peerSum = 0;
-        while (auto bytes = co_await receiver.recv()) {
-            // Send bytes to local stream
-            // std::println("[ProxyServer] Tunnel '{}' write {} bytes data to local", streamId, bytes->size());
-            ILIAS_CO_TRYV(co_await local.writeAll(bytes->data()));
 
-            // Update the peer send window
-            peerSum += bytes->size();
-            if (peerSum < HAJIMI_INIT_WINDOW_SIZE / 2) {
-                // Wait for peer custome more
-                continue;
+        // Wrapper stream to track the active connections
+        struct Stream {
+            Stream(ProxyStatus::Ptr status, TcpStream stream) : status(status), stream(std::move(stream)) {
+                status->activeConnections += 1;
+                status->totalConnections += 1;
             }
-            auto _ = mMessageSender.trySend(WindowUpdate {
-                .streamId = streamId,
-                .size = static_cast<uint32_t>(peerSum)
-            });
-            peerSum = 0;
-        }
-        // Peer closed?
-        co_return {};
-    };
-    auto _ = co_await ilias::whenAny(
-        readCopyWorker(),
-        writeCopyWorker(),
-        tunnel->closed.wait()
-    );
-    co_return {};
+
+            Stream(Stream &&) = default;
+            
+            ~Stream() {
+                if (status) {
+                    status->activeConnections -= 1;
+                }
+            }
+
+            // Impl readable
+            auto read(ilias::MutableBuffer buffer) { return stream.read(buffer); }
+
+            // Impl writable
+            auto write(ilias::Buffer buffer) { return stream.write(buffer); }
+            auto flush() { return stream.flush(); }
+            auto shutdown() { return stream.shutdown(); }
+
+            ProxyStatus::Ptr status;
+            TcpStream  stream;
+        };
+        co_return Stream {
+            status,
+            std::move(local)
+        };
+    });
 }
 
 // MARK: ProxyRule
@@ -611,9 +538,7 @@ auto ProxyRule::run() -> IoTask<void> {
             auto session = it->second;
 
             // Start it in scope
-            session->mScope->spawn(
-                session->tunnelWorker(mStatus, std::move(sock), mTargetHost, mTargetPort)
-            );
+            session->openTunnel(mStatus, std::move(sock), mTargetHost, mTargetPort);
         }
     };
     co_await ilias::whenAny(main(), mStopSource.get_token()); // Wait for stop request
