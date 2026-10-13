@@ -39,6 +39,18 @@ public:
         int duckdnsInterval = 300;
     };
 
+    struct Rule {
+        std::uint16_t listenPort; // The port the server should listen on
+        std::string   clientName; // The name of the client forward to
+        std::string   targetHost; // The host of the target
+        std::uint16_t targetPort; // The port of the target
+    };
+
+    // TODO:
+    struct Status {
+        
+    };
+
     ProxyServer(Config config);
     ~ProxyServer();
 
@@ -63,15 +75,15 @@ public:
      * @param json The json string of the request
      * @return Result<void, std::string> 
      */
-    auto addRule(std::string_view json) -> Result<void, std::string>;
+    auto addRule(Rule rule) -> Result<void, std::string>;
 
     /**
      * @brief Remove an rule
      * 
      * @param json The json string of the request
-     * @return Result<void, std::string> 
+     * @return false if the rule not found
      */
-    auto removeRule(std::string_view json) -> Result<void, std::string>;
+    auto removeRule(std::uint16_t port) -> Result<void, std::string>;
 private:
     auto handleSession(TcpStream stream) -> IoTask<void>;
 

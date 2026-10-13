@@ -3,6 +3,10 @@
 #include <ilias/signal.hpp>
 #include <ilias/task.hpp>
 
+#ifndef NDEBUG
+    #include <gtest/gtest.h>
+#endif // NDEBUG
+
 #include <sstream>
 #include <print>
 
@@ -41,6 +45,12 @@ int ilias_main(int argc, char **argv) try {
 
     parser.add_argument("--name")
         .help("Client name (used when running in client mode)");
+
+#ifndef NDEBUG
+    parser.add_argument("--test")
+        .flag()
+        .help("Run tests instead of the application");
+#endif // NDEBUG
 
     // Parse it
     parser.parse_args(argc, argv);
@@ -97,6 +107,12 @@ int ilias_main(int argc, char **argv) try {
         );
         co_return 0;
     }
+#ifndef NDEBUG
+    else if (parser.get<bool>("--test")) {
+        ::testing::InitGoogleTest();
+        co_return RUN_ALL_TESTS();
+    }
+#endif // NDEBUG
     else {
         std::stringstream ss;
         ss << parser;
@@ -106,5 +122,5 @@ int ilias_main(int argc, char **argv) try {
 }
 catch (std::exception &e) {
     std::println(stderr, "{}", e.what());
-    co_return 0;
+    co_return 1;
 }

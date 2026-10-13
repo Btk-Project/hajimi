@@ -32,6 +32,7 @@ private:
     
     auto handleIncoming(Stream stream) -> IoTask<void>;
     auto dispatch(Stream &stream, std::string_view method, std::string_view path, std::string_view content) -> IoTask<void>;
+    static auto reply(Stream &stream, int code, std::string_view content, std::string_view type) -> IoTask<void>;
 
     ProxyServer &mServer;
     IPEndpoint   mEndpoint;

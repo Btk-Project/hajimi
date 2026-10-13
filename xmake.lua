@@ -12,6 +12,11 @@ add_requires("ilias dev", {configs = {static = true}})
 -- Import json, argparse, etc...
 add_requires("nlohmann_json", "argparse")
 
+-- Import gtest if debug
+if is_mode("debug") then
+    add_requires("gtest")
+end
+
 target("hajimi")
     set_kind("binary")
     add_packages("ilias")
@@ -25,3 +30,11 @@ target("hajimi")
     if is_mode("release") then
         add_rules("c++.unity_build")
     end
+
+    -- Unit test for debug mode
+    if is_mode("debug") then
+        add_packages("gtest")
+        add_files("./tests/*.cpp")
+        add_tests("unit", {runargs = {"--test"}, timeout = 10000})
+    end
+target_end()

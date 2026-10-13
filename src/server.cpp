@@ -299,34 +299,22 @@ auto ProxyServer::status() const -> std::string {
     // return js.dump(4);
 }
 
-auto ProxyServer::addRule(std::string_view ruleJson) -> Result<void, std::string> try {
-    using nlohmann::json;
-    if (!mScope) {
-        return ilias::Err("Server is not fully started yet");
-    }
-
-    // Parse it
-    auto rule = json::parse(ruleJson);
-
+auto ProxyServer::addRule(Rule rule) -> Result<void, std::string> try {
     // {"listen_port":666,"client_name":"hajimi-client","target_host":"127.0.0.1","target_port":555}
-    auto listenPort = rule["listen_port"].get<uint16_t>();
-    auto clientName=  rule["client_name"].get<std::string>();
-    auto targetHost = rule["target_host"].get<std::string>();
-    auto targetPort = rule["target_port"].get<uint16_t>();
-    if (mRules.contains(listenPort)) {
+    if (mRules.contains(rule.listenPort)) {
         return ilias::Err("Port already used");
     }
 
-    std::println("[ProxyServer] addRule from 0:{} => {}({}: {})", listenPort, clientName, targetHost, targetPort);
+    std::println("[ProxyServer] addRule from 0:{} => {}({}: {})", rule.listenPort, rule.clientName, rule.targetHost, rule.targetPort);
 
     // Create it
     std::shared_ptr<ProxyRule> ruleWorker {
         new ProxyRule { //< Inplace
             .mServer = *this,
-            .mEndpoint = IPEndpoint{"[::0]:" + std::to_string(listenPort)},
-            .mClientName = clientName,
-            .mTargetHost = targetHost,
-            .mTargetPort = targetPort,
+            .mEndpoint = IPEndpoint{"[::0]:" + std::to_string(rule.listenPort)},
+            .mClientName = rule.clientName,
+            .mTargetHost = rule.targetHost,
+            .mTargetPort = rule.targetPort,
             .mStatus = std::make_shared<ProxyStatus>(),
         }
     };
@@ -345,11 +333,8 @@ catch (std::exception &exp) {
     return ilias::Err(exp.what());
 }
 
-auto ProxyServer::removeRule(std::string_view ruleJson) -> Result<void, std::string> try {
+auto ProxyServer::removeRule(std::uint16_t port) -> Result<void, std::string> {
     // {"listen_port":666}
-    using nlohmann::json;
-
-    auto port = json::parse(ruleJson)["listen_port"].get<uint16_t>();
     auto it = mRules.find(port);
     if (it == mRules.end()) {
         return ilias::Err("Rule not found");
@@ -357,9 +342,6 @@ auto ProxyServer::removeRule(std::string_view ruleJson) -> Result<void, std::str
     auto &[_, rulePtr] = *it;
     rulePtr->mStopSource.request_stop(); // Request to stop, it will remove self from the map
     return {};
-}
-catch (std::exception &exp) {
-    return ilias::Err(exp.what());
 }
 
 // MARK: ClientSession

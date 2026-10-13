@@ -15,6 +15,8 @@ using ilias::TcpListener;
 using ilias::TcpStream;
 using ilias::BufStream;
 using ilias::TaskScope;
+using ilias::Result;
+using ilias::Err;
 using ilias::Task;
 
 // Static
@@ -111,27 +113,6 @@ auto WebUi::handleIncoming(Stream stream) -> IoTask<void> {
 }
 
 auto WebUi::dispatch(Stream &stream, std::string_view method, std::string_view path, std::string_view content) -> IoTask<void> {
-    auto reply = [&](int code, std::string reason, std::string_view content, std::string_view type) -> IoTask<void> {
-        auto headers = std::format(
-            "HTTP/1.1 {} {}\r\n"
-            "Content-Type: {}\r\n"
-            "Content-Length: {}\r\n"
-            "Connection: keep-alive\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
-            "\r\n",
-            code, reason,
-            type,
-            content.size()
-        );
-        ILIAS_CO_TRYV(co_await stream.writeAll(ilias::makeBuffer(headers)));
-        if (!content.empty()) {
-            ILIAS_CO_TRYV(co_await stream.writeAll(ilias::makeBuffer(content)));
-        }
-        co_return {};
-    };
-
     using namespace std::chrono;
     using nlohmann::json;
 
@@ -143,34 +124,70 @@ auto WebUi::dispatch(Stream &stream, std::string_view method, std::string_view p
             _binary_index_html_start,
             _binary_index_html_end
         };
-        co_return co_await reply(200, "OK", html, "text/html; charset=utf-8");
+        co_return co_await reply(stream, 200, html, "text/html; charset=utf-8");
     }
     // Status
     if (path == "/api/status" && method == "GET") {
         auto status = mServer.status();
-        co_return co_await reply(200, "OK", status, "application/json; charset=utf-8");
+        co_return co_await reply(stream, 200, status, "application/json; charset=utf-8");
     }
-    if (path == "/api/rules" && (method == "POST" || method == "DELETE")) {
-        json js = json::object();
+    if (path == "/api/rules" && (method == "POST") || (method == "DELETE")) {
+        // POST {"listen_port":666,"client_name":"hajimi-client","target_host":"127.0.0.1","target_port":555}
+        // DELETE {"listen_port":666}
+        auto res = [&]() -> Result<void, std::string> {
+            try {
+                auto js = json::parse(content);
 
-        // Fill the reply
-        auto res = [&]() {
-            if (method == "POST") { // add rule
-                std::println("[WebUi] add rule: {}", content);
-                return mServer.addRule(content);
+                if (method == "DELETE") { // remove
+                    return mServer.removeRule(js["listen_port"]);
+                }
+                else {
+                    return mServer.addRule(ProxyServer::Rule {
+                        .listenPort = js["listen_port"],
+                        .clientName = js["client_name"],
+                        .targetHost = js["target_host"],
+                        .targetPort = js["target_port"]
+                    });
+                }
             }
-            else {
-                std::println("[WebUi] remove rule: {}", content);
-                return mServer.removeRule(content);
+            catch (const std::exception &e) {
+                return Err(e.what());
             }
         }();
-        js["ok"] = res.has_value();
-        if (!res) {
-            js["error"] = res.error();
-        }
-        auto code = res ? 200 : 400;
-        auto reason = res ? "OK" : "BAD REQUEST";
-        co_return co_await reply(code, reason, js.dump(), "application/json; charset=utf-8");
+        json js {
+            {"ok", res.has_value()},
+            {"error", res ? json{} : json(res.error()) }
+        };
+        co_return co_await reply(stream, res ? 200 : 400, js.dump(), "application/json; charset=utf-8");
     }
-    co_return co_await reply(404, "Not Found", "404 Not Found", "text/plain");
+    co_return co_await reply(stream, 404, "404 Not Found", "text/plain");
+}
+
+auto WebUi::reply(Stream &stream, int code, std::string_view content, std::string_view type) -> IoTask<void> {
+    std::string_view reason;
+    switch (code) {
+        case 200: reason = "OK"; break;
+        case 400: reason = "Bad Request"; break;
+        case 404: reason = "Not Found"; break;
+        default: reason = "Unknown"; break;
+    }
+
+    auto headers = std::format(
+        "HTTP/1.1 {} {}\r\n"
+        "Content-Type: {}\r\n"
+        "Content-Length: {}\r\n"
+        "Connection: keep-alive\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
+        "\r\n",
+        code, reason,
+        type,
+        content.size()
+    );
+    ILIAS_CO_TRYV(co_await stream.writeAll(ilias::makeBuffer(headers)));
+    if (!content.empty()) {
+        ILIAS_CO_TRYV(co_await stream.writeAll(ilias::makeBuffer(content)));
+    }
+    co_return {};
 }
