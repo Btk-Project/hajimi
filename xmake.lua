@@ -2,6 +2,12 @@ add_rules("mode.debug", "mode.release")
 set_languages("c++23")
 set_encodings("utf-8")
 
+option("quic")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable the ngtcp2 async QUIC wrapper")
+option_end()
+
 -- Update
 add_rules("plugin.compile_commands.autoupdate", {outputdir = "build", lsp = "clangd"})
 
@@ -17,11 +23,22 @@ if is_mode("debug") then
     add_requires("gtest")
 end
 
+if has_config("quic") then
+    includes("packages/ngtcp2-quic/xmake.lua")
+    add_requires("ngtcp2-quic 1.25.0")
+end
+
 target("hajimi")
     set_kind("binary")
     add_packages("ilias")
     add_packages("nlohmann_json", "argparse")
     add_files("src/*.cpp")
+
+    if has_config("quic") then
+        add_packages("ngtcp2-quic")
+        add_defines("HAJIMI_QUIC")
+        add_files("src/quic/*.cpp")
+    end
 
     -- For static resource
     add_rules("utils.bin2obj", {extensions = ".html"})
@@ -35,6 +52,9 @@ target("hajimi")
     if is_mode("debug") then
         add_packages("gtest")
         add_files("./tests/*.cpp")
+        if has_config("quic") then
+            add_defines('HAJIMI_QUIC_TEST_DIR="' .. path.absolute("tests/certs"):gsub("\\", "/") .. '"')
+        end
         add_tests("unit", {runargs = {"--test"}, timeout = 10000})
     end
 target_end()

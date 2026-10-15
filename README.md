@@ -1,5 +1,8 @@
 # Hajimi - 轻量级 C++ 内网穿透 / 反向代理
 
+QUIC 异步 wrapper 可通过 `xmake f -m debug --quic=y` 开启，默认关闭。
+接口与使用示例见 [src/quic/README.md](src/quic/README.md)。
+
 基于 C++23 协程与 ilias 异步运行时实现的反向代理工具，支持内网穿透、WebUI 可视化管理、动态端口转发与 DuckDNS 动态域名。
 
 ## 🌟 特性
