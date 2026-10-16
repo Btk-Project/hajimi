@@ -4,6 +4,7 @@
 #include <ilias/task.hpp>
 #include <ilias/net.hpp>
 #include <ilias/io.hpp>
+#include <vector>
 #include <string>
 
 // Import
@@ -27,6 +28,7 @@ public:
     struct Config {
         std::string master; // Master address, "host:port", a domain:port or "[ipv6]:port"
         std::string name; // Client name
+        std::vector<std::pair<IPEndpoint, std::string>> forwards; // The local forward connections
     };
 
     ProxyClient(Config config);

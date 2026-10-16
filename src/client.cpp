@@ -41,6 +41,7 @@ public:
     // Workers
     auto readWorker(MessageReader &reader) -> IoTask<void>;
     auto writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void>;
+    auto forwardWorker(std::span<const std::pair<IPEndpoint, std::string>> forwards) -> IoTask<void>;
 };
 
 
@@ -122,12 +123,14 @@ auto ProxyClient::connectOnce(bool &registered) -> IoTask<void> {
         // If any error, we stop the whole scope
         auto _ = co_await ilias::whenAny(
             state.readWorker(reader),
-            state.writeWorker(writer, std::move(receiver))
+            state.writeWorker(writer, std::move(receiver)),
+            state.forwardWorker(mConfig.forwards)
         );
         scope.stop();
         co_return {};
     };
-    co_await ilias::whenAll(main(), scope.waitAll());
+    scope.spawn(main());
+    co_await scope.waitAll();
     co_return {};
 }
 
@@ -182,4 +185,51 @@ auto ClientState::writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Messa
         ILIAS_CO_TRYV(co_await writer.writeMessage(std::move(*msg)));
     }
     co_return {};
+}
+
+auto ClientState::forwardWorker(std::span<const std::pair<IPEndpoint, std::string>> forwards) -> IoTask<void> {
+    using namespace std::chrono_literals;
+    if (forwards.empty()) {
+        while (true) { // Suspend forever
+            co_await ilias::sleep(1h);
+        }
+    }
+
+    // Start each worker
+    std::vector<IoTask<void>> subworkers;
+
+    auto addTunnel = [&](ilias::TcpStream stream, std::string target) {
+        // Alloc Id
+        auto id = mStreamId;
+        mStreamId += 2;
+
+        // Send server OpenTunnel
+        {
+            auto _ = mMessageSender.trySend(OpenTunnel {
+                .streamId = id,
+                .endpoint = target
+            });
+        }
+        mTunnels.addTunnel(id, [s = std::move(stream)]() mutable -> IoTask<DynStream> {
+            co_return std::move(s);
+        });
+    };
+    auto listenWorker = [&](IPEndpoint bind, std::string target) -> IoTask<void> {
+        std::println("[ProxyClient] Listening on '{}', forwarding to '{}'", bind, target);
+        ILIAS_CO_TRY(auto listener, co_await ilias::TcpListener::bind(bind));
+        while (true) {
+            auto conn = co_await listener.accept();
+            if (!conn) {
+                continue;
+            }
+            auto &[stream, endpoint] = *conn;
+            std::println("[ProxyClient] Accepted connection from '{}'", endpoint);
+            addTunnel(std::move(stream), target);
+        }
+    };
+
+    for (const auto &[listen, target] : forwards) {
+        subworkers.push_back(listenWorker(listen, target));
+    }
+    co_return co_await ilias::whenAny(std::move(subworkers));
 }

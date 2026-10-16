@@ -56,6 +56,8 @@ class ClientSession final {
 public:
     using Ptr = std::shared_ptr<ClientSession>;
 
+    ProxyServer &mServer;
+
     // Client info
     std::string mName;
     std::size_t mSendBytes = 0;
@@ -88,7 +90,8 @@ public:
     auto rateWorker() -> IoTask<void>;
     auto readWorker(MessageReader &reader) -> IoTask<void>;
     auto writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void>;
-    auto openTunnel(ProxyStatus::Ptr status, TcpStream local, std::string host, uint16_t port) -> void;
+    auto openTunnel(ProxyStatus::Ptr status, DynStream local, std::string host, uint16_t port) -> void;
+    auto onPeerOpenTunnel(uint64_t id, std::string targetEndpoint) -> bool;
 };
 
 
@@ -167,6 +170,7 @@ auto ProxyServer::handleSession(TcpStream stream) -> IoTask<void> {
     TaskScope scope;
     ClientSession::Ptr session {
         new ClientSession { // Pin
+            .mServer = *this,
             .mName = hello.name,
             .mRemoteEndpoint = stream.remoteEndpoint().value(),
             .mConnectedAt = std::chrono::steady_clock::now(),
@@ -384,6 +388,19 @@ auto ClientSession::readWorker(MessageReader &reader) -> IoTask<void> {
                 std::println("[ProxyServer] FatalError!!!! from '{}' => {}", mName, err.msg);
                 co_return {};
             }
+            case MessageType::OpenTunnel: { // From client to server, is forward
+                ILIAS_CO_TRY(auto open, msg.cast<OpenTunnel>());
+                if (open.streamId % 2 == 0) { // Should not be even
+                    std::println("[ProxyServer] Invalid streamId '{}' from client '{}'", open.streamId, mName);
+                    co_return {};
+                }
+                if (!onPeerOpenTunnel(open.streamId, open.endpoint)) {
+                    auto _ = mMessageSender.trySend(TunnelClose {
+                        .streamId = open.streamId,
+                    });
+                }
+                continue;
+            }
             default: {
                 std::println("[ProxyServer] Unexpected type from '{}', disconnect", mName);
                 co_return {};
@@ -443,7 +460,7 @@ auto ClientSession::rateWorker() -> IoTask<void> {
     co_return {};
 }
 
-auto ClientSession::openTunnel(ProxyStatus::Ptr status, TcpStream local, std::string host, uint16_t port) -> void {
+auto ClientSession::openTunnel(ProxyStatus::Ptr status, DynStream local, std::string host, uint16_t port) -> void {
     // Alloc streamId
     auto streamId = mStreamId;
     mStreamId += 2;
@@ -460,9 +477,11 @@ auto ClientSession::openTunnel(ProxyStatus::Ptr status, TcpStream local, std::st
 
         // Wrapper stream to track the active connections
         struct Stream {
-            Stream(ProxyStatus::Ptr status, TcpStream stream) : status(status), stream(std::move(stream)) {
-                status->activeConnections += 1;
-                status->totalConnections += 1;
+            Stream(ProxyStatus::Ptr status, DynStream stream) : status(status), stream(std::move(stream)) {
+                if (status) {
+                    status->activeConnections += 1;
+                    status->totalConnections += 1;
+                }
             }
 
             Stream(Stream &&) = default;
@@ -482,13 +501,43 @@ auto ClientSession::openTunnel(ProxyStatus::Ptr status, TcpStream local, std::st
             auto shutdown() { return stream.shutdown(); }
 
             ProxyStatus::Ptr status;
-            TcpStream  stream;
+            DynStream  stream;
         };
         co_return Stream {
             status,
             std::move(local)
         };
     });
+}
+
+auto ClientSession::onPeerOpenTunnel(uint64_t streamId, std::string endpoint) -> bool {
+    std::println("[ProxyServer] OpenTunnel from '{}' => {} '{}'", mName, endpoint, streamId);
+    auto vecs = endpoint | std::views::split(':') | std::ranges::to<std::vector<std::string>>();
+    if (vecs.size() != 2) {
+        std::println("[ProxyServer] Invalid endpoint '{}'", endpoint);
+        return false;
+    }
+    auto &target = vecs[0];
+    auto &portStr = vecs[1];
+    auto it = mServer.mSessions.find(target);
+    if (it == mServer.mSessions.end()) {
+        std::println("[ProxyServer] Client '{}' not found", target);
+        return false;
+    }
+    auto [_, wanted] = *it;
+    uint16_t port = 0;
+    if (std::from_chars(portStr.data(), portStr.data() + portStr.size(), port).ec != std::errc{}) {
+        std::println("[ProxyServer] Invalid port '{}'", portStr);
+        return false;
+    }
+
+    // Create a tunnel from client to client
+    auto [a, b] = ilias::DuplexStream::make(HAJIMI_MAX_DATA_EXCHANGE);
+    wanted->openTunnel(nullptr, std::move(b), "localhost", port);
+    mTunnels.addTunnel(streamId, [a = std::move(a)]() mutable -> IoTask<DynStream> {
+        co_return std::move(a);
+    });
+    return true;
 }
 
 // MARK: ProxyRule

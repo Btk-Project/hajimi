@@ -8,6 +8,7 @@
 #endif // NDEBUG
 
 #include <sstream>
+#include <ranges>
 #include <print>
 
 #include "server.hpp"
@@ -46,6 +47,13 @@ int ilias_main(int argc, char **argv) try {
     parser.add_argument("--name")
         .help("Client name (used when running in client mode)");
 
+    parser.add_argument("--transport")
+        .help("Transport layer to use (default: tcp, available: tcp, quic)");
+
+    parser.add_argument("--forward")
+        .help("The tunnel to the target serve e.g. '127.0.0.1:8848@client-name:8000'");
+
+    // Unit Test
 #ifndef NDEBUG
     parser.add_argument("--test")
         .flag()
@@ -95,10 +103,26 @@ int ilias_main(int argc, char **argv) try {
         co_return 0;
     }
     else if (auto connect = parser.present("--connect"); connect) {
+        std::vector<std::pair<IPEndpoint, std::string>> forwards; // e.g. 127.0.0.1:8848@client-name:8000
+        // Parse forwards 
+        if (auto forward = parser.present("--forward"); forward) {
+            for (auto s : *forward | std::views::split(',')) {
+                std::string_view f{s.begin(), s.end()};
+                auto pos = f.find('@');
+                if (pos == std::string::npos) {
+                    throw std::runtime_error{"Bad string in --forward, did you missing @?"};
+                }
+                auto target = f.substr(0, pos); // e.g. 127.0.0.1:8848
+                auto name = f.substr(pos + 1); // e.g. client-name:8000
+                forwards.emplace_back(IPEndpoint::fromString(target).value(), name);
+            }
+        }
+
         ProxyClient client {
             ProxyClient::Config {
                 .master = connect.value(),
-                .name = parser.present("--name").value_or("hajimi-client")
+                .name = parser.present("--name").value_or("hajimi-client"),
+                .forwards = std::move(forwards),
             }
         };
         auto _ = co_await ilias::whenAny(

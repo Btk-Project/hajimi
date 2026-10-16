@@ -94,4 +94,5 @@ private:
     std::map<std::string, std::shared_ptr<ClientSession> > mSessions; // name -> session
     std::map<std::uint16_t, std::shared_ptr<ProxyRule> >   mRules; // The rules of proxy [port: rule]
 friend class ProxyRule;
+friend class ClientSession;
 };
