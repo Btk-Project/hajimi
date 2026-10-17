@@ -294,6 +294,77 @@ ILIAS_TEST(Quic, CertificateAndAlpnFailures) {
     co_return;
 }
 
+ILIAS_TEST(Quic, ExternalPskWithoutCertificates) {
+    QuicContext::Config server;
+    server.role = QuicContext::Role::Server;
+    server.psk.emplace().fill(0x42);
+    QuicContext::Config client;
+    client.psk = server.psk;
+    auto result = co_await withConnections([](QuicConnection &local, QuicConnection &peer) -> IoTask<void> {
+        auto serve = [&]() -> IoTask<void> {
+            ILIAS_CO_TRY(auto stream, co_await peer.acceptStream());
+            co_return co_await echo(std::move(stream));
+        };
+        auto [sent, received] = co_await ilias::whenAll(exchange(local, 300000, 'p'), serve());
+        ILIAS_CO_TRYV(std::move(sent));
+        co_return std::move(received);
+    }, server, client);
+    EXPECT_TRUE(result) << result.error().message();
+    co_return;
+}
+
+ILIAS_TEST(Quic, ExternalPskFailures) {
+    for (int failure = 0; failure < 4; ++failure) {
+        QuicContext::Config server;
+        server.role = QuicContext::Role::Server;
+        server.psk.emplace().fill(0x42);
+        QuicContext::Config client;
+        client.psk = server.psk;
+        if (failure == 0) { client.psk->fill(0x43); }
+        if (failure == 1) { client.pskIdentity = "unknown"; }
+        if (failure == 2) { client.alpn = "another/1"; }
+        if (failure == 3) { client.psk.reset(); client.verifyPeer = false; }
+        auto result = co_await withContexts(server, client,
+            [](QuicContext &server, QuicContext &client) -> IoTask<void> {
+                auto connected = co_await client.connect(server.localEndpoint().value(), "localhost");
+                EXPECT_FALSE(connected);
+                if (!connected) { EXPECT_EQ(connected.error(), make_error_code(QuicError::Tls)); }
+                co_return {};
+            });
+        EXPECT_TRUE(result) << result.error().message();
+    }
+    co_return;
+}
+
+ILIAS_TEST(Quic, PskClientRejectsCertificateFallback) {
+    QuicContext::Config client;
+    client.psk.emplace().fill(0x42);
+    auto result = co_await withContexts(serverConfig(), client,
+        [](QuicContext &server, QuicContext &client) -> IoTask<void> {
+            auto connected = co_await client.connect(server.localEndpoint().value(), "localhost");
+            EXPECT_FALSE(connected);
+            if (!connected) { EXPECT_EQ(connected.error(), make_error_code(QuicError::Tls)); }
+            co_return {};
+        });
+    EXPECT_TRUE(result) << result.error().message();
+    co_return;
+}
+
+ILIAS_TEST(Quic, PskAndCertificateConfigurationAreExclusive) {
+    for (int failure = 0; failure < 4; ++failure) {
+        QuicContext::Config config;
+        config.psk.emplace().fill(0x42);
+        if (failure == 0) { config.certFile = HAJIMI_QUIC_TEST_DIR "/localhost.pem"; }
+        if (failure == 1) { config.keyFile = HAJIMI_QUIC_TEST_DIR "/localhost-key.pem"; }
+        if (failure == 2) { config.caFile = HAJIMI_QUIC_TEST_DIR "/localhost.pem"; }
+        if (failure == 3) { config.pskIdentity.clear(); }
+        auto result = co_await QuicContext::bind("127.0.0.1:0", config);
+        EXPECT_FALSE(result);
+        if (!result) { EXPECT_EQ(result.error(), std::errc::invalid_argument); }
+    }
+    co_return;
+}
+
 ILIAS_TEST(Quic, HandshakeTimeout) {
     auto config = clientConfig();
     config.handshakeTimeout = 100ms;

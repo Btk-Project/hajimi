@@ -40,6 +40,13 @@ int ilias_main(int argc, char **argv) try {
         .default_value(300)
         .help("DuckDNS update interval in seconds (default: 300)");
 
+    // Server Quic
+    parser.add_argument("--cert-file")
+        .help("Path to the certificate file");
+
+    parser.add_argument("--key-file")
+        .help("Path to the private key file");
+
     // Client options
     parser.add_argument("--connect")
         .help("Run as client: master address e.g. 'myhome.duckdns.org:8000', '127.0.0.1:8000', or '[::1]:8000'");
@@ -48,10 +55,20 @@ int ilias_main(int argc, char **argv) try {
         .help("Client name (used when running in client mode)");
 
     parser.add_argument("--transport")
-        .help("Transport layer to use (default: tcp, available: tcp, quic)");
+        .default_value(std::string{"auto"})
+        .help("Transport: auto (QUIC first, then plain TCP), tcp or quic");
 
     parser.add_argument("--forward")
         .help("The tunnel to the target serve e.g. '127.0.0.1:8848@client-name:8000'");
+
+    // Client Quic
+    parser.add_argument("--ca-file")
+        .help("The server certificate to trust");
+
+    parser.add_argument("--verify")
+        .flag()
+        .default_value(true)
+        .help("Verify the server certificate");
 
     // Unit Test
 #ifndef NDEBUG
@@ -84,6 +101,10 @@ int ilias_main(int argc, char **argv) try {
                 .listen = IPEndpoint::fromString(*listen).value(),
                 .webui = IPEndpoint::fromString(webui).value(),
 
+                // Quic
+                .certFile = parser.present("--cert-file").value_or(""),
+                .keyFile = parser.present("--key-file").value_or(""),
+
                 // DuckDns
                 .duckdnsDomain = duckdnsDomain,
                 .duckdnsToken = duckdnsToken,
@@ -96,6 +117,7 @@ int ilias_main(int argc, char **argv) try {
         );
         if (err && !*err) {
             std::println("[App] Server failed to start => {}", (*err).error().message());
+            co_return 1;
         }
         if (ctrlC) {
             std::println("[App] Ctrl-C, Quiting");
@@ -122,13 +144,22 @@ int ilias_main(int argc, char **argv) try {
             ProxyClient::Config {
                 .master = connect.value(),
                 .name = parser.present("--name").value_or("hajimi-client"),
+                .transport = parser.get<std::string>("--transport"),
                 .forwards = std::move(forwards),
+
+                // Quic
+                .caFile = parser.present("--ca-file").value_or(""),
+                .verify = parser.get<bool>("--verify"),
             }
         };
-        auto _ = co_await ilias::whenAny(
+        auto [result, ctrlC] = co_await ilias::whenAny(
             client.run(),
             ilias::signal::ctrlC()
         );
+        if (result && !*result) {
+            std::println(stderr, "[App] Client failed => {}", result->error().message());
+            co_return 1;
+        }
         co_return 0;
     }
 #ifndef NDEBUG

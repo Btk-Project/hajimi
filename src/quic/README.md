@@ -1,6 +1,6 @@
 # Async QUIC wrapper
 
-The wrapper uses ilias, ngtcp2 1.25.0 and OpenSSL 3.6.3 with
+The wrapper uses ilias, ngtcp2 1.25.0 and OpenSSL 3.5+ with
 `ngtcp2_crypto_ossl`. It provides QUIC v1 bidirectional byte streams.
 It currently uses fixed peer addresses, with no migration, 0-RTT, HTTP/3,
 or unreliable DATAGRAM API.
@@ -14,8 +14,9 @@ xmake test
 ```
 
 Disable it with `xmake f --quic=n`. When disabled, the QUIC sources and
-dependencies are not included. Enabling the wrapper does not change the
-proxy application's TCP transport.
+dependencies are not included. When enabled, the proxy defaults to TCP and QUIC
+on the server and QUIC-first connections on the client. See the root README for
+`--transport` and `--quic-psk-file`.
 
 `QuicContext` owns one UDP socket and drives all its connections in `run()`.
 Use each context and its handles on the same ilias executor. The context can
@@ -23,7 +24,15 @@ connect to multiple peers or accept multiple connections, according to its role.
 Both `connect()` and `accept()` return after the TLS handshake completes.
 The client verifies the certificate chain and the supplied DNS name or IP address
 by default. Set `caFile` for a private CA; the server requires `certFile` and
-`keyFile`. Both sides must use the same ALPN.
+`keyFile` in certificate mode. Both sides must use the same ALPN.
+
+For certificate-free TLS 1.3 external PSK authentication, set `Config::psk` to
+the same 32 random bytes on both peers. `pskIdentity` must also match (default
+`hajimi/shared/v1`). PSK mode is mutually exclusive with `certFile`, `keyFile`,
+and `caFile`; `verifyPeer` applies only to certificate mode. It enforces PSK
+selection and an ephemeral key exchange and never falls back to certificates.
+The server does not need credentials on disk, and `connect()` accepts an empty
+server name in PSK mode. Session tickets and 0-RTT remain disabled.
 
 A client operation can be scoped like this:
 

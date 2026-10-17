@@ -14,7 +14,8 @@
 
 // Import
 using ilias::IPEndpoint;
-using ilias::TcpStream;
+using ilias::TaskScope;
+using ilias::DynStream;
 using ilias::BufStream;
 using ilias::IoTask;
 using ilias::Result;
@@ -32,6 +33,10 @@ public:
     struct Config {
         IPEndpoint listen; // Bind on which address
         IPEndpoint webui; // The webui address
+
+        // Quic specific
+        std::string certFile;
+        std::string keyFile;
         
         // DuckDns
         std::string duckdnsDomain;
@@ -85,7 +90,9 @@ public:
      */
     auto removeRule(std::uint16_t port) -> Result<void, std::string>;
 private:
-    auto handleSession(TcpStream stream) -> IoTask<void>;
+    auto runTcp() -> IoTask<void>;
+    auto runQuic() -> IoTask<void>;
+    auto handleSession(DynStream stream, IPEndpoint remoteEndpoint) -> IoTask<void>;
 
     Config mConfig;
     ilias::TaskScope *mScope = nullptr;

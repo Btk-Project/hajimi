@@ -392,6 +392,11 @@ static auto callbacks() -> ngtcp2_callbacks {
             self.fail(make_error_code(QuicError::AlpnMismatch));
             return NGTCP2_ERR_CALLBACK_FAILURE;
         }
+        if (owner->config.psk && (SSL_session_reused(self.tls->ssl) != 1 ||
+            SSL_get_negotiated_group(self.tls->ssl) == 0)) {
+            self.fail(make_error_code(QuicError::Tls));
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
         self.handshake = true;
         return 0;
     };

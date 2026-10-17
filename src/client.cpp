@@ -15,6 +15,10 @@
 #include "skbuf.hpp"
 #include "utils.hpp"
 
+#ifdef HAJIMI_QUIC
+    #include "quic/quic.hpp"
+#endif
+
 // Import types
 using ilias::DynStream;
 using ilias::Buffer;
@@ -58,35 +62,92 @@ auto ProxyClient::run() -> IoTask<void> {
 
     std::println("[ProxyClient] client '{}' target master {}", mConfig.name, mConfig.master);
 
-    // Reconnect loop with backoff: 2s, x1.5 on each failure, up to 15s
-    seconds retryDelay = 2s;
-    while (true) {
-        bool registered = false;
-        if (auto res = co_await connectOnce(registered); !res) {
-            std::println("[ProxyClient] Connection failed: {}", res.error().message());
+    std::vector<IoTask<void>> tasks;
+    void *quicContext = nullptr;
+
+#if defined(HAJIMI_QUIC)
+    // Prepare quic context
+    auto ctxt = co_await QuicContext::bind(
+        "0.0.0.0:0",
+        QuicContext::Config {
+            .role = QuicContext::Role::Client,
+            .caFile = mConfig.caFile,
+            .verifyPeer = mConfig.verify,
         }
-        // Reset the delay once we registered successfully
-        retryDelay = registered ? 2s : std::min(retryDelay * 3 / 2, 15s);
-        co_await ilias::sleep(retryDelay);
+    );
+    if (ctxt) { // Quic initialized
+        quicContext = &*ctxt;
+        tasks.emplace_back(ctxt->run()); // Add loop job
     }
-    co_return {};
+#endif // HAJIMI_QUIC
+
+    // Main body
+    auto main = [&] -> IoTask<void> {
+        // Reconnect loop with backoff: 2s, x1.5 on each failure, up to 15s
+        seconds retryDelay = 2s;
+        while (true) {
+            bool registered = false;
+            if (auto res = co_await connectOnce(registered, quicContext); !res) {
+                std::println("[ProxyClient] Connection failed: {}", res.error().message());
+            }
+            // Reset the delay once we registered successfully
+            retryDelay = registered ? 2s : std::min(retryDelay * 3 / 2, 15s);
+            co_await ilias::sleep(retryDelay);
+        }
+        co_return {};
+    };
+    tasks.emplace_back(main());
+    co_return co_await ilias::whenAny(std::move(tasks));
 }
 
-auto ProxyClient::connectOnce(bool &registered) -> IoTask<void> {
+auto ProxyClient::connectOnce(bool &registered, void *quicContext) -> IoTask<void> {
     using namespace std::literals;
 
-    std::println("[ProxyClient] Connecting to master {}...", mConfig.master);
     // Resolve the master address, it may be a domain name (re-resolve on each reconnect)
     ILIAS_CO_TRY(auto info, co_await ilias::AddressInfo::lookup(mConfig.master));
+
+#ifdef HAJIMI_QUIC
+    // Try quic first, other wise, fallback to tcp
+    std::error_code lastErr;
+    do {
+        if (mConfig.transport == "tcp" || !quicContext || info.endpoints().empty()) {
+            break;
+        }
+        auto ctxt = static_cast<QuicContext *>(quicContext);
+        // TODO: HE2? for QUIC?, i use a silly way here
+        std::println("[ProxyClient] Connecting to master {} using QUIC...", mConfig.master);
+        auto conn = co_await ctxt->connect(info.endpoints()[0], mConfig.master);
+        if (!conn) { // Failed
+            lastErr = conn.error();
+            break;
+        }
+        auto stream = co_await conn->openStream();
+        if (!stream) { // Failed
+            lastErr = conn.error();
+            break;
+        }
+        co_return co_await runOnce(registered, *stream);
+    }
+    while (false);
+    if (mConfig.transport == "quic") { // Didn't allow fallback
+        co_return ilias::Err(lastErr);
+    }
+    std::println("[ProxyClient] Fallback to TCP...");
+#endif // HAJIMI_QUIC
+    
+    std::println("[ProxyClient] Connecting to master {} using TCP...", mConfig.master);
     ILIAS_CO_TRY(auto stream, co_await happy_eyeballs::connect(info.endpoints()));
     auto _ = stream.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
+    co_return co_await runOnce(registered, stream);
+}
 
+auto ProxyClient::runOnce(bool &registered, StreamView stream) -> IoTask<void> {
+    std::println("[ProxyClient] Connected to master {}", mConfig.master);
+    
     // Do handshake
     SkBufferPool pool{HAJIMI_POOL_CONFIG};
     MessageReader reader{stream, pool};
     MessageWriter writer{stream, pool};
-
-    std::println("[ProxyClient] Connected to master {}", mConfig.master);
 
     // Register and wait for the ack
     ILIAS_CO_TRYV(co_await writer.writeMessage(Hello {

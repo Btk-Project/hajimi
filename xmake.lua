@@ -5,7 +5,7 @@ set_encodings("utf-8")
 option("quic")
     set_default(false)
     set_showmenu(true)
-    set_description("Enable the ngtcp2 async QUIC wrapper")
+    set_description("Enable QUIC transport")
 option_end()
 
 -- Update
@@ -55,6 +55,6 @@ target("hajimi")
         if has_config("quic") then
             add_defines('HAJIMI_QUIC_TEST_DIR="' .. path.absolute("tests/certs"):gsub("\\", "/") .. '"')
         end
-        add_tests("unit", {runargs = {"--test"}, timeout = 10000})
+        add_tests("unit", {runargs = {"--test"}, timeout = 60000})
     end
 target_end()

@@ -16,6 +16,10 @@
 #include "utils.hpp"
 #include "web.hpp"
 
+#ifdef HAJIMI_QUIC
+    #include "quic/quic.hpp"
+#endif // HAJIMI_QUIC
+
 using ilias::MutableBuffer;
 using ilias::TcpListener;
 using ilias::IPEndpoint;
@@ -105,12 +109,6 @@ ProxyServer::~ProxyServer() {
 }
 
 auto ProxyServer::run() -> IoTask<void> {
-    std::println("[ProxyServer] listen on {}", mConfig.listen);
-
-    ILIAS_CO_TRY(auto listener, co_await ilias::TcpBuilder{mConfig.listen.family()}
-        .option(ilias::sockopt::ReuseAddress{true})
-        .bind(mConfig.listen)
-    );
     mStartTime = std::chrono::steady_clock::now();
 
     // Make duckdns
@@ -122,31 +120,87 @@ auto ProxyServer::run() -> IoTask<void> {
     WebUi ui{*this, mConfig.webui};
 
     // Handle incoming connection
-    auto main = TaskScope::enter([&](auto &scope) -> Task<void> {
+    co_return co_await TaskScope::enter([&](auto &scope) -> IoTask<void> {
         mScope = &scope;
         if (mDuckDns) {
             scope.spawn(mDuckDns->run());
         }
+        std::vector<IoTask<void>> tasks;
+        tasks.emplace_back(ui.run());
+        tasks.emplace_back(runTcp());
+
+#if defined(HAJIMI_QUIC)
+        tasks.emplace_back(runQuic());
+#endif // HAJIMI_QUIC
+
+        co_return co_await ilias::whenAny(std::move(tasks));
+    });
+}
+
+auto ProxyServer::runTcp() -> IoTask<void> {
+    std::println("[ProxyServer] Tcp listen on {}", mConfig.listen);
+
+    ILIAS_CO_TRY(auto listener, co_await ilias::TcpBuilder{mConfig.listen.family()}
+        .option(ilias::sockopt::ReuseAddress{true})
+        .bind(mConfig.listen)
+    );
+
+    while (true) {
+        auto incoming = co_await listener.accept();
+        if (!incoming) {
+            std::println("[ProxyServer] error at accept {}", incoming.error().message());
+            continue;
+        }
+        auto &[sock, addr] = *incoming;
+        auto _ = sock.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
+        std::println("[ProxyServer] New tcp connection from {}", addr);
+        mScope->spawn(handleSession(std::move(sock), addr));
+    }
+}
+
+#if defined(HAJIMI_QUIC)
+auto ProxyServer::runQuic() -> IoTask<void> {
+    using namespace std::chrono_literals;
+    if (mConfig.certFile.empty() || mConfig.keyFile.empty()) {
+        std::println("[ProxyServer] Cert or key file is empty, disable quic");
+        while (true) {
+            co_await ilias::sleep(1h); // Wait for cancel
+        }
+    }
+
+    std::println("[ProxyServer] Quic listen on {}", mConfig.listen);
+    ILIAS_CO_TRY(auto listener, co_await QuicContext::bind(
+        mConfig.listen,
+        QuicContext::Config {
+            .role = QuicContext::Role::Server,
+            .certFile = mConfig.certFile,
+            .keyFile = mConfig.keyFile,
+        }
+    ));
+
+    auto worker = [&](QuicConnection conn) -> IoTask<void> { // Take the lifetime of the connection
+        ILIAS_CO_TRY(auto stream, co_await conn.acceptStream());
+        co_return co_await handleSession(std::move(stream), conn.remoteEndpoint());
+    };
+
+    // Accept each connections
+    auto loop = [&]() -> Task<void> {
         while (true) {
             auto incoming = co_await listener.accept();
             if (!incoming) {
                 std::println("[ProxyServer] error at accept {}", incoming.error().message());
                 continue;
             }
-            auto &[sock, addr] = *incoming;
-            auto _ = sock.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
-            scope.spawn(handleSession(std::move(sock)));
+            std::println("ProxyServer] New quic connection from {}", incoming->remoteEndpoint());
+            mScope->spawn(worker(std::move(*incoming)));
         }
-    });
-    auto [_, uiErr] = co_await ilias::whenAny(std::move(main), ui.run());
-    if (uiErr && !*uiErr) { // Failed to start webui?
-        co_return ilias::Err(uiErr->error());
-    }
-    // Should be unreachable, waiting for cancel
+    };
+    auto _ = co_await ilias::whenAll(loop(), listener.run());
     co_return {};
 }
+#endif // HAJIMI_QUIC
 
-auto ProxyServer::handleSession(TcpStream stream) -> IoTask<void> {
+auto ProxyServer::handleSession(DynStream stream, IPEndpoint remoteEndpoint) -> IoTask<void> {
     SkBufferPool pool{HAJIMI_POOL_CONFIG};
     MessageReader reader{stream, pool};
     MessageWriter writer{stream, pool};
@@ -172,7 +226,7 @@ auto ProxyServer::handleSession(TcpStream stream) -> IoTask<void> {
         new ClientSession { // Pin
             .mServer = *this,
             .mName = hello.name,
-            .mRemoteEndpoint = stream.remoteEndpoint().value(),
+            .mRemoteEndpoint = remoteEndpoint,
             .mConnectedAt = std::chrono::steady_clock::now(),
             .mMessageSender = sender,
             .mTunnels = TunnelManager {
@@ -192,7 +246,7 @@ auto ProxyServer::handleSession(TcpStream stream) -> IoTask<void> {
             co_return {};
         }
     }
-    std::println("[ProxyServer] New Client '{}' from {}", hello.name, stream.remoteEndpoint().value());
+    std::println("[ProxyServer] New Client '{}' from {}", hello.name, remoteEndpoint);
 
     // Add RAII guard remove when disconnect
     ScopeExit exit{[this, session, &scope]() {
@@ -204,15 +258,17 @@ auto ProxyServer::handleSession(TcpStream stream) -> IoTask<void> {
     ILIAS_CO_TRYV(co_await writer.writeMessage(HelloAck{}));
 
     // Do the main loop
-    auto _ = co_await ilias::whenAll(
-        ilias::whenAny(
+    auto main = [&]() -> Task<void> {
+        auto _ = co_await ilias::whenAny(
             session->readWorker(reader),
             session->writeWorker(writer, std::move(receiver)),
             session->pingWorker(),
             session->rateWorker()
-        ),
-        scope.waitAll()
-    );
+        );
+        scope.stop();
+    };
+    scope.spawn(main());
+    co_await scope.waitAll();
     co_return {};
 }
 

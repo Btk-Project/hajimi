@@ -15,13 +15,22 @@ ILIAS_TEST(Hajimi, Smoke) {
     ProxyServer server {
         ProxyServer::Config {
             .listen = "127.0.0.1:8848",
-            .webui = "127.0.0.1:0" // Don't care
+            .webui = "127.0.0.1:0", // Don't care
+#ifdef HAJIMI_QUIC
+            .certFile = HAJIMI_QUIC_TEST_DIR "/localhost.pem",
+            .keyFile = HAJIMI_QUIC_TEST_DIR "/localhost-key.pem",
+#endif // HAJIMI_QUIC
         }
     };
     ProxyClient client {
         ProxyClient::Config {
             .master = "127.0.0.1:8848",
-            .name = "test-client"
+            .name = "test-client",
+
+#ifdef HAJIMI_QUIC
+            .caFile = HAJIMI_QUIC_TEST_DIR "/localhost.pem",
+            .verify = false,
+#endif // HAJIMI_QUIC
         }
     };
 

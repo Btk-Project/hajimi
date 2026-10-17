@@ -3,6 +3,7 @@
 #include <ilias/io.hpp>
 #include <ilias/net.hpp>
 #include <chrono>
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
@@ -49,6 +50,8 @@ public:
         size_t connectionWindow = 4 * 1024 * 1024;
         size_t sendBufferLimit = 256 * 1024; // Per stream, including unacknowledged data.
         size_t connectionSendBufferLimit = 4 * 1024 * 1024;
+        std::optional<std::array<unsigned char, 32>> psk;
+        std::string pskIdentity = "hajimi/shared/v1";
     };
 
     QuicContext(const QuicContext &) = delete;
