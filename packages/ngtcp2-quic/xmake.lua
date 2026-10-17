@@ -16,7 +16,7 @@ package("ngtcp2-quic")
             "-DENABLE_SHARED_LIB=OFF",
             "-DENABLE_STATIC_LIB=ON",
             "-DBUILD_TESTING=OFF",
-            "-DOPENSSL_USE_STATIC_LIBS=TRUE",
+            -- "-DOPENSSL_USE_STATIC_LIBS=TRUE",
             "-DOPENSSL_ROOT_DIR=" .. package:dep("openssl3"):installdir(),
             "-DCMAKE_BUILD_TYPE=" .. (package:debug() and "Debug" or "Release")
         }

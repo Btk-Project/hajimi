@@ -32,8 +32,8 @@ public:
     // onMessage
     auto addTunnel(uint64_t id, Entry entry) -> void; // Peer send the open message
     auto closeTunnel(uint64_t id) -> void; // Peer send the close message
-    auto onWindowUpdate(uintptr_t id, size_t window) -> void; // Peer send the window update message
-    auto onDataExchange(uintptr_t id, SkBuffer buffer) -> void;
+    auto onWindowUpdate(uint64_t id, size_t window) -> void; // Peer send the window update message
+    auto onDataExchange(uint64_t id, SkBuffer buffer) -> void;
 private:
     struct Tunnel;
 
