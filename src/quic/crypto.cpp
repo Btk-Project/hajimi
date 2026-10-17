@@ -104,6 +104,12 @@ auto makeTlsContext(const QuicContext::Config &config) -> ilias::IoResult<TlsCon
         SSL_CTX_set_verify(context.get(), SSL_VERIFY_PEER, nullptr);
         auto ok = config.caFile.empty() ? SSL_CTX_set_default_verify_paths(context.get()) :
             SSL_CTX_load_verify_locations(context.get(), config.caFile.c_str(), nullptr);
+#ifdef _WIN32
+        if (config.caFile.empty()) {
+            // OpenSSL's default PEM paths do not include Windows' root store.
+            ok = SSL_CTX_load_verify_store(context.get(), "org.openssl.winstore:") == 1 || ok == 1;
+        }
+#endif
         if (ok != 1) {
             return Err(make_error_code(QuicError::Tls));
         }

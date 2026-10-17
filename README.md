@@ -12,7 +12,7 @@ QUIC 异步 wrapper 可通过 `xmake f -m debug --quic=y` 开启，默认关闭�
 - **WebUI 控制台**：查看在线客户端、延迟、实时上下行速率，动态新增 / 删除转发规则；页面编译进可执行文件。
 - **DuckDNS 自动更新**：定期更新域名记录，IPv4 由 DuckDNS 自动识别，探测到公网 IPv6 时一并更新。
 - **IPv6 / 双栈**：转发端口默认监听 `[::]`；客户端连接支持域名、IPv4、`[ipv6]:port`，并采用 Happy Eyeballs 方式多地址连接。
-- **健壮性**：客户端断线自动重连（退避 2s → 15s，每次重连重新解析 DNS），服务端 30s 心跳检测。
+- **健壮性**：客户端断线自动重连（退避 2s → 15s，每次重连重新解析 DNS）
 
 ---
 
@@ -56,6 +56,18 @@ hajimi --connect "1.2.3.4:8000" --name "mypc"
 hajimi --connect "[2001:db8::1]:8000" --name "mypc"
 ```
 > `--name` 默认为 `hajimi-client`，同名客户端只能同时在线一个。
+
+启用 QUIC 后，客户端默认验证服务端的证书链和域名；Windows 会额外使用系统根证书库。公共 CA 证书可直接连接，服务端的 `--cert-file` 应提供包含中间证书的完整链（如 Let's Encrypt 的 `fullchain.pem`）。
+
+```bash
+# Force QUIC to verify the connection without a TCP fallback
+hajimi --connect "myhome.duckdns.org:8000" --transport quic
+
+# Trust a private CA or a self-signed certificate
+hajimi --connect "myhome.duckdns.org:8000" --transport quic --ca-file "ca.pem"
+```
+
+`--insecure` 可显式关闭证书验证
 
 ### 3. 配置反向代理转发
 

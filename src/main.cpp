@@ -65,10 +65,9 @@ int ilias_main(int argc, char **argv) try {
     parser.add_argument("--ca-file")
         .help("The server certificate to trust");
 
-    parser.add_argument("--verify")
+    parser.add_argument("--insecure")
         .flag()
-        .default_value(true)
-        .help("Verify the server certificate");
+        .help("Disable server certificate verification");
 
     // Unit Test
 #ifndef NDEBUG
@@ -149,7 +148,7 @@ int ilias_main(int argc, char **argv) try {
 
                 // Quic
                 .caFile = parser.present("--ca-file").value_or(""),
-                .verify = parser.get<bool>("--verify"),
+                .verify = !parser.get<bool>("--insecure"),
             }
         };
         auto [result, ctrlC] = co_await ilias::whenAny(

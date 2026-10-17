@@ -489,7 +489,7 @@ auto ClientSession::pingWorker() -> IoTask<void> {
             std::println("[ProxyServer] Client '{}' pong timeout, disconnect", mName);
             co_return {};
         }
-        co_await ilias::sleep(30s);
+        co_await ilias::sleep(10s); // Leave room before QUIC's 30s idle timeout.
     }
 }
 

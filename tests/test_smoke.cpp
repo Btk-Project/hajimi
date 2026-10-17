@@ -5,6 +5,11 @@
 #include "../src/client.hpp"
 #include "../src/server.hpp"
 
+#ifdef HAJIMI_QUIC
+    #include "../src/quic/quic.hpp"
+    #include "../src/protocol.hpp"
+#endif // HAJIMI_QUIC
+
 using namespace std::literals;
 using ilias::TcpListener;
 using ilias::TcpStream;
@@ -28,8 +33,9 @@ ILIAS_TEST(Hajimi, Smoke) {
             .name = "test-client",
 
 #ifdef HAJIMI_QUIC
+            .transport = "quic",
             .caFile = HAJIMI_QUIC_TEST_DIR "/localhost.pem",
-            .verify = false,
+            .verify = true,
 #endif // HAJIMI_QUIC
         }
     };
@@ -81,3 +87,56 @@ ILIAS_TEST(Hajimi, Smoke) {
     EXPECT_TRUE(result);
     co_return;
 }
+
+#ifdef HAJIMI_QUIC
+ILIAS_TEST(Hajimi, ClientKeepsIdleQuicConnectionAlive) {
+    auto bound = co_await QuicContext::bind("127.0.0.1:0", {
+        .role = QuicContext::Role::Server,
+        .certFile = HAJIMI_QUIC_TEST_DIR "/localhost.pem",
+        .keyFile = HAJIMI_QUIC_TEST_DIR "/localhost-key.pem",
+        .idleTimeout = 15s,
+    });
+    EXPECT_TRUE(bound) << bound.error().message();
+    if (!bound) {
+        co_return;
+    }
+    auto server = std::move(*bound);
+    ProxyClient client{{
+        .master = std::format("{}", server.localEndpoint().value()),
+        .name = "idle-client",
+        .transport = "quic",
+        .caFile = HAJIMI_QUIC_TEST_DIR "/localhost.pem",
+    }};
+    auto serve = [&]() -> IoTask<void> {
+        ILIAS_CO_TRY(auto connection, co_await server.accept());
+        ILIAS_CO_TRY(auto stream, co_await connection.acceptStream());
+        SkBufferPool pool{HAJIMI_POOL_CONFIG};
+        MessageReader reader{stream, pool};
+        MessageWriter writer{stream, pool};
+        ILIAS_CO_TRY(auto hello, co_await reader.readMessage());
+        EXPECT_EQ(hello.type(), MessageType::Hello);
+        ILIAS_CO_TRYV(co_await writer.writeMessage(HelloAck{}));
+        // This peer sends no periodic pings; the client must keep it alive.
+        for (int i = 0; i < 3; ++i) {
+            ILIAS_CO_TRY(auto ping, co_await reader.readMessage());
+            EXPECT_EQ(ping.type(), MessageType::Ping);
+            ILIAS_CO_TRYV(co_await writer.writeMessage(Pong{}));
+        }
+        co_await ilias::sleep(5s);
+        ILIAS_CO_TRYV(co_await writer.writeMessage(Ping{}));
+        ILIAS_CO_TRY(auto pong, co_await reader.readMessage());
+        EXPECT_EQ(pong.type(), MessageType::Pong);
+        co_return {};
+    };
+    co_await ilias::TaskScope::enter([&](ilias::TaskScope &scope) -> ilias::Task<void> {
+        scope.spawn(server.run());
+        scope.spawn(client.run());
+        auto result = co_await ilias::timeout(serve(), 40s);
+        EXPECT_TRUE(result);
+        if (result) {
+            EXPECT_TRUE(*result) << result->error().message();
+        }
+        scope.stop();
+    });
+}
+#endif // HAJIMI_QUIC

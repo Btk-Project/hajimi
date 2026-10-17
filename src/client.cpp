@@ -45,6 +45,7 @@ public:
     // Workers
     auto readWorker(MessageReader &reader) -> IoTask<void>;
     auto writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Message> receiver) -> IoTask<void>;
+    auto pingWorker() -> IoTask<void>;
     auto forwardWorker(std::span<const std::pair<IPEndpoint, std::string>> forwards) -> IoTask<void>;
 };
 
@@ -68,7 +69,7 @@ auto ProxyClient::run() -> IoTask<void> {
 #if defined(HAJIMI_QUIC)
     // Prepare quic context
     auto ctxt = co_await QuicContext::bind(
-        "0.0.0.0:0",
+        "[::0]:0",
         QuicContext::Config {
             .role = QuicContext::Role::Client,
             .caFile = mConfig.caFile,
@@ -78,6 +79,12 @@ auto ProxyClient::run() -> IoTask<void> {
     if (ctxt) { // Quic initialized
         quicContext = &*ctxt;
         tasks.emplace_back(ctxt->run()); // Add loop job
+    }
+    else {
+        std::println("[ProxyClient] QUIC initialization failed: {}", ctxt.error().message());
+        if (mConfig.transport == "quic") {
+            co_return ilias::Err(ctxt.error());
+        }
     }
 #endif // HAJIMI_QUIC
 
@@ -114,16 +121,24 @@ auto ProxyClient::connectOnce(bool &registered, void *quicContext) -> IoTask<voi
             break;
         }
         auto ctxt = static_cast<QuicContext *>(quicContext);
+        auto name = mConfig.master;
+        if (name.starts_with('[')) {
+            name = name.substr(1, name.find(']') - 1); // Unwrap an IPv6 literal.
+        }
+        else if (auto pos = name.rfind(':'); pos != std::string::npos) {
+            name.resize(pos); // Trim port
+        }
+
         // TODO: HE2? for QUIC?, i use a silly way here
-        std::println("[ProxyClient] Connecting to master {} using QUIC...", mConfig.master);
-        auto conn = co_await ctxt->connect(info.endpoints()[0], mConfig.master);
+        std::println("[ProxyClient] Connecting to master {} using QUIC...", name);
+        auto conn = co_await ctxt->connect(info.endpoints()[0], name);
         if (!conn) { // Failed
             lastErr = conn.error();
             break;
         }
         auto stream = co_await conn->openStream();
         if (!stream) { // Failed
-            lastErr = conn.error();
+            lastErr = stream.error();
             break;
         }
         co_return co_await runOnce(registered, *stream);
@@ -132,7 +147,7 @@ auto ProxyClient::connectOnce(bool &registered, void *quicContext) -> IoTask<voi
     if (mConfig.transport == "quic") { // Didn't allow fallback
         co_return ilias::Err(lastErr);
     }
-    std::println("[ProxyClient] Fallback to TCP...");
+    std::println("[ProxyClient] Fallback to TCP... reason: {}", lastErr.message());
 #endif // HAJIMI_QUIC
     
     std::println("[ProxyClient] Connecting to master {} using TCP...", mConfig.master);
@@ -182,11 +197,17 @@ auto ProxyClient::runOnce(bool &registered, StreamView stream) -> IoTask<void> {
     };
     auto main = [&]() -> IoTask<void> {
         // If any error, we stop the whole scope
-        auto _ = co_await ilias::whenAny(
+        auto [read, write, forward, ping] = co_await ilias::whenAny(
             state.readWorker(reader),
             state.writeWorker(writer, std::move(receiver)),
-            state.forwardWorker(mConfig.forwards)
+            state.forwardWorker(mConfig.forwards),
+            state.pingWorker()
         );
+        for (const auto res : {read, write, forward, ping}) {
+            if (res && !res->has_value()) {
+                std::println("[ProxyClient] Session ended: {}", res->error().message());
+            }
+        }
         scope.stop();
         co_return {};
     };
@@ -202,6 +223,9 @@ auto ClientState::readWorker(MessageReader &reader) -> IoTask<void> {
         switch (msg.type()) {
             case MessageType::Ping: { // Reply Pong
                 auto _ = mMessageSender.trySend(Pong{});
+                continue;
+            }
+            case MessageType::Pong: {
                 continue;
             }
             case MessageType::OpenTunnel: { // Request to open tunnel
@@ -246,6 +270,17 @@ auto ClientState::writeWorker(MessageWriter &writer, ilias::mpsc::Receiver<Messa
         ILIAS_CO_TRYV(co_await writer.writeMessage(std::move(*msg)));
     }
     co_return {};
+}
+
+auto ClientState::pingWorker() -> IoTask<void> {
+    using namespace std::chrono_literals;
+    while (true) {
+        // Stay below QUIC's 30s idle timeout, including with older servers.
+        co_await ilias::sleep(10s);
+        if (!mMessageSender.trySend(Ping{})) {
+            co_return {};
+        }
+    }
 }
 
 auto ClientState::forwardWorker(std::span<const std::pair<IPEndpoint, std::string>> forwards) -> IoTask<void> {

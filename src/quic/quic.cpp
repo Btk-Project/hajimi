@@ -9,6 +9,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <print>
 #include <stop_token>
 #include <utility>
 
@@ -324,6 +325,13 @@ auto ConnectionState::handleError(int value) -> void {
         fail(make_error_code(tlsError ? QuicError::Tls : QuicError::ConnectionClosed));
     }
     else {
+        if (value == NGTCP2_ERR_CRYPTO && tls && tls->ssl) {
+            auto result = SSL_get_verify_result(tls->ssl);
+            if (result != X509_V_OK) {
+                std::println(stderr, "[QUIC] Certificate verification failed: {}",
+                    X509_verify_cert_error_string(result));
+            }
+        }
         fail(transportError(value));
         if (value != NGTCP2_ERR_IDLE_CLOSE && value != NGTCP2_ERR_DROP_CONN &&
             value != NGTCP2_ERR_RETRY) {
@@ -811,7 +819,11 @@ auto QuicContext::bind(IPEndpoint local, Config config) -> IoTask<QuicContext> {
     auto state = std::make_shared<quic::ContextState>();
     state->config = std::move(config);
     ILIAS_CO_TRY(state->tls, quic::makeTlsContext(state->config));
-    ILIAS_CO_TRY(state->socket, co_await ilias::UdpSocket::bind(local));
+    ilias::UdpBuilder builder{local.family()};
+    if (local.family() == AF_INET6) {
+        builder.option(ilias::sockopt::Ipv6Only{false});
+    }
+    ILIAS_CO_TRY(state->socket, co_await builder.bind(local));
     ILIAS_CO_TRY(state->local, state->socket.localEndpoint());
     co_return QuicContext{std::move(state)};
 }
@@ -835,6 +847,9 @@ auto QuicContext::localEndpoint() const -> IoResult<IPEndpoint> {
 
 auto QuicContext::connect(IPEndpoint remote, std::string serverName) -> IoTask<QuicConnection> {
     auto state = mState;
+    if (state && state->local.family() == AF_INET6 && remote.family() == AF_INET) {
+        remote = IPEndpoint{ilias::IPAddress6::fromV4Mapped(remote.address4()), remote.port()};
+    }
     if (!state || state->config.role != Role::Client || remote.family() != state->local.family()) {
         co_return Err(std::make_error_code(std::errc::invalid_argument));
     }
