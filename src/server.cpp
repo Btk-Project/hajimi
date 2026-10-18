@@ -64,6 +64,7 @@ public:
 
     // Client info
     std::string mName;
+    std::string mTag;
     std::size_t mSendBytes = 0;
     std::size_t mRecvBytes = 0;
     IPEndpoint  mRemoteEndpoint;
@@ -154,7 +155,7 @@ auto ProxyServer::runTcp() -> IoTask<void> {
         auto &[sock, addr] = *incoming;
         auto _ = sock.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
         std::println("[ProxyServer] New tcp connection from {}", addr);
-        mScope->spawn(handleSession(std::move(sock), addr));
+        mScope->spawn(handleSession(std::move(sock), addr, "TCP"));
     }
 }
 
@@ -180,7 +181,7 @@ auto ProxyServer::runQuic() -> IoTask<void> {
 
     auto worker = [&](QuicConnection conn) -> IoTask<void> { // Take the lifetime of the connection
         ILIAS_CO_TRY(auto stream, co_await conn.acceptStream());
-        co_return co_await handleSession(std::move(stream), conn.remoteEndpoint());
+        co_return co_await handleSession(std::move(stream), conn.remoteEndpoint(), "QUIC");
     };
 
     // Accept each connections
@@ -200,7 +201,7 @@ auto ProxyServer::runQuic() -> IoTask<void> {
 }
 #endif // HAJIMI_QUIC
 
-auto ProxyServer::handleSession(DynStream stream, IPEndpoint remoteEndpoint) -> IoTask<void> {
+auto ProxyServer::handleSession(DynStream stream, IPEndpoint remoteEndpoint, std::string tag) -> IoTask<void> {
     SkBufferPool pool{HAJIMI_POOL_CONFIG};
     MessageReader reader{stream, pool};
     MessageWriter writer{stream, pool};
@@ -226,6 +227,7 @@ auto ProxyServer::handleSession(DynStream stream, IPEndpoint remoteEndpoint) -> 
         new ClientSession { // Pin
             .mServer = *this,
             .mName = hello.name,
+            .mTag = tag,
             .mRemoteEndpoint = remoteEndpoint,
             .mConnectedAt = std::chrono::steady_clock::now(),
             .mMessageSender = sender,
@@ -285,6 +287,7 @@ auto ProxyServer::status() const -> std::string {
     for (const auto &[name, client] : mSessions) {
         clients.push_back(json {
             {"name", name},
+            {"tag", client->mTag},
             {"remote_ip", client->mRemoteEndpoint.toString()},
             {"uptime_seconds", duration_cast<seconds>(steady_clock::now() - client->mConnectedAt).count()},
             {"ping_ms", client->mLatencyMs},

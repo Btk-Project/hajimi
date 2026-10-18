@@ -3,6 +3,7 @@
 #include <ilias/testing.hpp>
 #include <ilias/sync.hpp>
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
 #include <vector>
 #include "../src/quic/quic.hpp"
@@ -65,9 +66,10 @@ auto exchange(QuicConnection &connection, size_t size, char value) -> IoTask<voi
 
 template <typename Fn>
 auto withContexts(QuicContext::Config serverConfig, QuicContext::Config clientConfig, Fn fn,
-    IPEndpoint bind = IPEndpoint::fromString("127.0.0.1:0").value()) -> IoTask<void> {
+    IPEndpoint bind = IPEndpoint::fromString("127.0.0.1:0").value(),
+    std::optional<IPEndpoint> clientBind = {}) -> IoTask<void> {
     ILIAS_CO_TRY(auto server, co_await QuicContext::bind(bind, std::move(serverConfig)));
-    ILIAS_CO_TRY(auto client, co_await QuicContext::bind(bind, std::move(clientConfig)));
+    ILIAS_CO_TRY(auto client, co_await QuicContext::bind(clientBind.value_or(bind), std::move(clientConfig)));
     co_return co_await ilias::TaskScope::enter([&](ilias::TaskScope &scope) -> IoTask<void> {
         scope.spawn(server.run());
         scope.spawn(client.run());
@@ -546,6 +548,289 @@ ILIAS_TEST(Quic, RunStopsNormally) {
     EXPECT_TRUE(result);
     if (result) { EXPECT_TRUE(*result); }
     co_return;
+}
+
+ILIAS_TEST(Quic, ContextShutdownNotifiesAllPeers) {
+    for (int mode = 0; mode < 4; ++mode) {
+        auto serverBound = co_await QuicContext::bind("127.0.0.1:0", serverConfig());
+        auto clientBound = co_await QuicContext::bind("127.0.0.1:0", clientConfig());
+        EXPECT_TRUE(serverBound);
+        EXPECT_TRUE(clientBound);
+        if (!serverBound || !clientBound) { co_return; }
+        auto server = std::move(*serverBound);
+        auto client = std::move(*clientBound);
+        auto result = co_await ilias::TaskScope::enter([&](ilias::TaskScope &scope) -> IoTask<void> {
+            auto serverDriver = scope.spawn(server.run());
+            auto clientDriver = scope.spawn(client.run());
+            std::vector<QuicConnection> locals, peers;
+            std::vector<QuicStream> localStreams, peerStreams;
+            for (int i = 0; i < 3; ++i) {
+                auto [connected, accepted] = co_await ilias::whenAll(
+                    client.connect(server.localEndpoint().value(), "localhost"), server.accept());
+                ILIAS_CO_TRY(auto local, std::move(connected));
+                ILIAS_CO_TRY(auto peer, std::move(accepted));
+                ILIAS_CO_TRY(auto outgoing, co_await local.openStream());
+                ILIAS_CO_TRYV(co_await outgoing.writeString("a"));
+                ILIAS_CO_TRY(auto incoming, co_await peer.acceptStream());
+                char byte;
+                ILIAS_CO_TRYV(co_await incoming.readAll(ilias::makeBuffer(&byte, 1)));
+                locals.push_back(std::move(local));
+                peers.push_back(std::move(peer));
+                localStreams.push_back(std::move(outgoing));
+                peerStreams.push_back(std::move(incoming));
+            }
+            bool stopClient = mode < 2;
+            if (mode % 2) {
+                (stopClient ? clientDriver : serverDriver).stop();
+            }
+            else {
+                (stopClient ? client : server).stop();
+            }
+            auto &connections = stopClient ? peers : locals;
+            auto &streams = stopClient ? peerStreams : localStreams;
+            for (size_t i = 0; i < streams.size(); ++i) {
+                char byte;
+                auto read = co_await ilias::timeout(streams[i].read(ilias::makeBuffer(&byte, 1)), 500ms);
+                EXPECT_TRUE(read) << "Peer did not receive CONNECTION_CLOSE, mode " << mode;
+                if (read) {
+                    EXPECT_FALSE(*read);
+                    if (!*read) { EXPECT_EQ(read->error(), make_error_code(QuicError::ConnectionClosed)); }
+                }
+                EXPECT_EQ(connections[i].appError(), 0);
+            }
+            scope.stop();
+            co_return {};
+        });
+        EXPECT_TRUE(result) << result.error().message();
+    }
+}
+
+ILIAS_TEST(Quic, LostClosePacketIsRetransmitted) {
+    auto result = co_await withContexts(serverConfig(), clientConfig(),
+        [](QuicContext &server, QuicContext &client) -> IoTask<void> {
+            ILIAS_CO_TRY(auto front, co_await ilias::UdpSocket::bind("127.0.0.1:0"));
+            ILIAS_CO_TRY(auto back, co_await ilias::UdpSocket::bind("127.0.0.1:0"));
+            bool dropClose = false;
+            bool dropped = false;
+            auto relay = [&](ilias::UdpSocket &input, ilias::UdpSocket &output,
+                IPEndpoint target, bool fromClient) -> IoTask<void> {
+                std::array<std::byte, 65536> buffer;
+                while (true) {
+                    ILIAS_CO_TRY(auto packet, co_await input.recvfrom(ilias::makeBuffer(buffer)));
+                    if (fromClient && std::exchange(dropClose, false)) {
+                        dropped = true;
+                        continue;
+                    }
+                    ILIAS_CO_TRYV(co_await output.sendto(ilias::makeBuffer(buffer.data(), packet.first), target));
+                }
+            };
+            co_return co_await ilias::TaskScope::enter([&](ilias::TaskScope &scope) -> IoTask<void> {
+                scope.spawn(relay(front, back, server.localEndpoint().value(), true));
+                scope.spawn(relay(back, front, client.localEndpoint().value(), false));
+                auto [connected, accepted] = co_await ilias::whenAll(
+                    client.connect(front.localEndpoint().value(), "localhost"), server.accept());
+                ILIAS_CO_TRY(auto local, std::move(connected));
+                ILIAS_CO_TRY(auto peer, std::move(accepted));
+                co_await ilias::sleep(30ms); // Drain handshake ACKs before dropping the close.
+                dropClose = true;
+                ILIAS_CO_TRYV(co_await local.close(77));
+                ILIAS_CO_TRY(auto probe, co_await peer.openStream());
+                ILIAS_CO_TRYV(co_await probe.writeString("still connected?"));
+                auto closed = co_await ilias::timeout(peer.acceptStream(), 1s);
+                EXPECT_TRUE(closed);
+                if (closed) {
+                    EXPECT_FALSE(*closed);
+                    if (!*closed) { EXPECT_EQ(closed->error(), make_error_code(QuicError::ConnectionClosed)); }
+                }
+                EXPECT_TRUE(dropped);
+                EXPECT_EQ(peer.appError(), 77);
+                scope.stop();
+                co_return {};
+            });
+        });
+    EXPECT_TRUE(result) << result.error().message();
+}
+
+ILIAS_TEST(Quic, BufferedStreamsOutliveContext) {
+    std::optional<QuicStream> sender, receiver;
+    auto result = co_await withConnections([&](QuicConnection &local, QuicConnection &peer) -> IoTask<void> {
+        ILIAS_CO_TRY(auto outgoing, co_await local.openStream());
+        ILIAS_CO_TRYV(co_await outgoing.writeString(std::string(16384, 'x')));
+        ILIAS_CO_TRY(auto incoming, co_await peer.acceptStream());
+        char byte;
+        ILIAS_CO_TRYV(co_await incoming.readAll(ilias::makeBuffer(&byte, 1)));
+        sender.emplace(std::move(outgoing));
+        receiver.emplace(std::move(incoming));
+        co_return {};
+    });
+    EXPECT_TRUE(result) << result.error().message();
+    // Destroy pooled RX/TX data after both contexts and connections are gone.
+    sender.reset();
+    receiver.reset();
+}
+
+ILIAS_TEST(Quic, PmtudProbesAndSmallerPath) {
+    for (size_t limit : {1452, 1200}) {
+        auto result = co_await withContexts(serverConfig(), clientConfig(),
+            [limit](QuicContext &server, QuicContext &client) -> IoTask<void> {
+                ILIAS_CO_TRY(auto front, co_await ilias::UdpSocket::bind("127.0.0.1:0"));
+                ILIAS_CO_TRY(auto back, co_await ilias::UdpSocket::bind("127.0.0.1:0"));
+                size_t largest = 0;
+                size_t dropped = 0;
+                size_t largePackets = 0;
+                auto relay = [&](ilias::UdpSocket &input, ilias::UdpSocket &output, IPEndpoint target) -> IoTask<void> {
+                    std::array<std::byte, 65536> buffer;
+                    while (true) {
+                        ILIAS_CO_TRY(auto packet, co_await input.recvfrom(ilias::makeBuffer(buffer)));
+                        auto size = packet.first;
+                        largest = std::max(largest, size);
+                        if (size > limit) {
+                            ++dropped;
+                            continue;
+                        }
+                        if (size > 1200) { ++largePackets; }
+                        ILIAS_CO_TRYV(co_await output.sendto(ilias::makeBuffer(buffer.data(), size), target));
+                    }
+                };
+                co_return co_await ilias::TaskScope::enter([&](ilias::TaskScope &scope) -> IoTask<void> {
+                    scope.spawn(relay(front, back, server.localEndpoint().value()));
+                    scope.spawn(relay(back, front, client.localEndpoint().value()));
+                    auto [connected, accepted] = co_await ilias::whenAll(
+                        client.connect(front.localEndpoint().value(), "localhost"), server.accept());
+                    ILIAS_CO_TRY(auto local, std::move(connected));
+                    ILIAS_CO_TRY(auto peer, std::move(accepted));
+                    auto serve = [&]() -> IoTask<void> {
+                        ILIAS_CO_TRY(auto stream, co_await peer.acceptStream());
+                        co_return co_await echo(std::move(stream));
+                    };
+                    auto [sent, read] = co_await ilias::whenAll(exchange(local, 512 * 1024, 'm'), serve());
+                    ILIAS_CO_TRYV(std::move(sent));
+                    ILIAS_CO_TRYV(std::move(read));
+                    EXPECT_GT(largest, 1200);
+                    EXPECT_LE(largest, 1452);
+                    if (limit == 1200) { EXPECT_GT(dropped, 0); }
+                    else { EXPECT_GT(largePackets, 16); }
+                    scope.stop();
+                    co_return {};
+                });
+            });
+        EXPECT_TRUE(result) << result.error().message();
+    }
+}
+
+ILIAS_TEST(Quic, HostnameAndNumericAddresses) {
+    for (bool dualStack : {false, true}) {
+        auto result = co_await withContexts(serverConfig(), clientConfig(),
+            [dualStack](QuicContext &server, QuicContext &client) -> IoTask<void> {
+                std::vector<std::string> hosts{"localhost", "127.0.0.1"};
+                if (dualStack) { hosts.push_back("[::1]"); }
+                for (const auto &host : hosts) {
+                    auto [connected, accepted] = co_await ilias::whenAll(
+                        client.connect(std::format("{}:{}", host, server.localEndpoint().value().port())),
+                        server.accept());
+                    ILIAS_CO_TRY(auto local, std::move(connected));
+                    ILIAS_CO_TRY(auto peer, std::move(accepted));
+                    auto serve = [&]() -> IoTask<void> {
+                        ILIAS_CO_TRY(auto stream, co_await peer.acceptStream());
+                        co_return co_await echo(std::move(stream));
+                    };
+                    auto [sent, read] = co_await ilias::whenAll(exchange(local, 4096, 'h'), serve());
+                    ILIAS_CO_TRYV(std::move(sent));
+                    ILIAS_CO_TRYV(std::move(read));
+                }
+                // No duplicate connection is left queued for a fast successful handshake.
+                EXPECT_FALSE(co_await ilias::timeout(server.accept(), 30ms));
+                co_return {};
+            }, "[::]:0", IPEndpoint{dualStack ? "[::]:0" : "127.0.0.1:0"});
+        EXPECT_TRUE(result) << result.error().message();
+    }
+}
+
+ILIAS_TEST(Quic, HostnameRaceSkipsUnresponsiveFamily) {
+    ilias::addrinfo_t hints{};
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    hints.ai_flags = AI_NUMERICSERV;
+    auto resolved = co_await ilias::AddressInfo::lookup("localhost:1", hints);
+    EXPECT_TRUE(resolved);
+    if (!resolved) { co_return; }
+    auto endpoints = resolved->endpoints();
+    bool hasV4 = std::ranges::any_of(endpoints, [](auto ep) { return ep.family() == AF_INET; });
+    bool hasV6 = std::ranges::any_of(endpoints, [](auto ep) { return ep.family() == AF_INET6; });
+    EXPECT_TRUE(hasV4 && hasV6);
+    if (!hasV4 || !hasV6) { co_return; }
+    bool preferV6 = endpoints.front().family() == AF_INET6;
+    auto result = co_await withContexts(serverConfig(), clientConfig(),
+        [preferV6](QuicContext &server, QuicContext &client) -> IoTask<void> {
+            auto port = server.localEndpoint().value().port();
+            auto first = std::format("{}:{}", preferV6 ? "[::1]" : "127.0.0.1", port);
+            ILIAS_CO_TRY(auto blackhole, co_await ilias::UdpSocket::bind(IPEndpoint{first}));
+            // The first family stays silent; the other must win before its 2s timeout.
+            auto connected = co_await ilias::timeout(client.connect(std::format("localhost:{}", port)), 1s);
+            EXPECT_TRUE(connected);
+            if (!connected) { co_return Err(std::make_error_code(std::errc::timed_out)); }
+            ILIAS_CO_TRY(auto local, std::move(*connected));
+            ILIAS_CO_TRY(auto peer, co_await server.accept());
+            std::array<std::byte, 65536> packet;
+            EXPECT_TRUE(co_await ilias::timeout(blackhole.recvfrom(ilias::makeBuffer(packet)), 100ms));
+            ILIAS_CO_TRY(auto stream, co_await local.openStream());
+            ILIAS_CO_TRYV(co_await stream.writeString("winner"));
+            ILIAS_CO_TRY(auto incoming, co_await peer.acceptStream());
+            std::array<char, 6> bytes;
+            ILIAS_CO_TRYV(co_await incoming.readAll(ilias::makeBuffer(bytes)));
+            EXPECT_EQ(std::string_view(bytes.data(), bytes.size()), "winner");
+            co_return {};
+        }, IPEndpoint{preferV6 ? "127.0.0.1:0" : "[::1]:0"}, IPEndpoint{"[::]:0"});
+    EXPECT_TRUE(result) << result.error().message();
+}
+
+ILIAS_TEST(Quic, HostnameConnectRejectsInvalidAddresses) {
+    auto bound = co_await QuicContext::bind("127.0.0.1:0", clientConfig());
+    EXPECT_TRUE(bound);
+    if (!bound) { co_return; }
+    for (const auto *address : {"", "localhost", ":1145", "localhost:", "[]:1145", "[::1:1145",
+        "::1:1145", "localhost:0", "localhost:-1", "localhost:65536", "localhost:1145junk"}) {
+        auto result = co_await bound->connect(address);
+        EXPECT_FALSE(result) << address;
+        if (!result) { EXPECT_EQ(result.error(), std::errc::invalid_argument) << address; }
+    }
+}
+
+ILIAS_TEST(Quic, HostnameConnectPreservesTlsVerification) {
+    auto config = clientConfig();
+    config.caFile.clear();
+    auto result = co_await withContexts(serverConfig(), config,
+        [](QuicContext &server, QuicContext &client) -> IoTask<void> {
+            auto connected = co_await client.connect(std::format("localhost:{}", server.localEndpoint().value().port()));
+            EXPECT_FALSE(connected);
+            if (!connected) { EXPECT_EQ(connected.error(), make_error_code(QuicError::Tls)); }
+            co_return {};
+        }, "[::]:0");
+    EXPECT_TRUE(result) << result.error().message();
+}
+
+ILIAS_TEST(Quic, HostnameConnectCancellation) {
+    auto result = co_await withContexts(serverConfig(), clientConfig(),
+        [](QuicContext &server, QuicContext &client) -> IoTask<void> {
+            ILIAS_CO_TRY(auto blackhole, co_await ilias::UdpSocket::bind("127.0.0.1:0"));
+            ilias::TaskGroup<ilias::IoResult<QuicConnection>> pending;
+            auto handle = pending.spawn(client.connect(blackhole.localEndpoint()->toString()));
+            std::array<std::byte, 65536> packet;
+            auto initial = co_await ilias::timeout(blackhole.recvfrom(ilias::makeBuffer(packet)), 500ms);
+            EXPECT_TRUE(initial);
+            // Drain any additional Initial packets before canceling the handshake.
+            while (co_await ilias::timeout(blackhole.recvfrom(ilias::makeBuffer(packet)), 5ms)) {}
+            handle.stop();
+            EXPECT_FALSE(co_await pending.next());
+            EXPECT_TRUE(co_await ilias::timeout(blackhole.recvfrom(ilias::makeBuffer(packet)), 500ms));
+            co_await pending.shutdown();
+            auto [connected, accepted] = co_await ilias::whenAll(
+                client.connect(server.localEndpoint()->toString()), server.accept());
+            ILIAS_CO_TRY(auto local, std::move(connected));
+            ILIAS_CO_TRY(auto peer, std::move(accepted));
+            co_return {};
+        });
+    EXPECT_TRUE(result) << result.error().message();
 }
 
 #endif // HAJIMI_QUIC

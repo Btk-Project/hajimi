@@ -148,6 +148,7 @@
       background: #334155;
       color: #38bdf8;
     }
+    .tag-quic { background: rgba(167, 139, 250, 0.15); color: #c4b5fd; }
     .empty-tip { color: var(--text-muted); text-align: center; padding: 24px; font-size: 14px; }
 
     #toast {
@@ -269,6 +270,7 @@
         <thead>
           <tr>
             <th>客户端名称 (Name)</th>
+            <th>传输协议</th>
             <th>远端 IP 地址</th>
             <th>延迟 (Ping)</th>
             <th>上传速率 (↑)</th>
@@ -278,7 +280,7 @@
           </tr>
         </thead>
         <tbody id="clients-body">
-          <tr><td colspan="7" class="empty-tip">等待客户端连接中...</td></tr>
+          <tr><td colspan="8" class="empty-tip">等待客户端连接中...</td></tr>
         </tbody>
       </table>
     </div>
@@ -317,6 +319,11 @@
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
     if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + " MB";
     return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+  }
+
+  function formatTransport(tag) {
+    if (tag !== "TCP" && tag !== "QUIC") return "—";
+    return `<span class="tag${tag === "QUIC" ? " tag-quic" : ""}">${tag}</span>`;
   }
 
   function formatPing(ms) {
@@ -397,11 +404,12 @@
     // Render Clients Table
     const clientsBody = document.getElementById("clients-body");
     if (!data.clients || data.clients.length === 0) {
-      clientsBody.innerHTML = '<tr><td colspan="7" class="empty-tip">等待客户端连接中...</td></tr>';
+      clientsBody.innerHTML = '<tr><td colspan="8" class="empty-tip">等待客户端连接中...</td></tr>';
     } else {
       clientsBody.innerHTML = data.clients.map(c => `
         <tr>
           <td><b>${c.name}</b></td>
+          <td>${formatTransport(c.tag)}</td>
           <td><span class="tag">${c.remote_ip}</span></td>
           <td>${formatPing(c.ping_ms)}</td>
           <td>

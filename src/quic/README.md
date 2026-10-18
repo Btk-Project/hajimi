@@ -22,6 +22,15 @@ on the server and QUIC-first connections on the client. See the root README for
 Use each context and its handles on the same ilias executor. The context can
 connect to multiple peers or accept multiple connections, according to its role.
 Both `connect()` and `accept()` return after the TLS handshake completes.
+`connect("host:port")` resolves DNS on each call, deduplicates and interleaves
+IPv4/IPv6 candidates, then races their handshakes with a 250 ms stagger.
+An explicit failure starts the next attempt immediately. The first successful,
+verified handshake wins; other attempts are canceled and joined before returning.
+The original hostname is used for SNI and certificate verification. Numeric
+addresses such as `127.0.0.1:1145` and `[::1]:1145` use IP SAN verification.
+Bind a client context to `[::]:0` to race both families; an IPv4-only context
+resolves IPv4 candidates only. The endpoint-plus-server-name overload remains
+available when the caller already has a specific address.
 The client verifies the certificate chain and the supplied DNS name or IP address
 by default. Set `caFile` for a private CA; the server requires `certFile` and
 `keyFile` in certificate mode. Both sides must use the same ALPN.
@@ -73,6 +82,16 @@ to accept an entire buffer; the wrapper retains unacknowledged data for
 retransmission. Per-stream and per-connection limits bound these queues.
 Receive credit is returned when data is consumed or discarded.
 
+Stream RX/TX data uses `SkBufferPool`, with writes split into at most 16 KiB
+chunks. Buffers retain their pool if a stream outlives its connection or context.
+Connection lists and iteration snapshots remain vectors of handles.
+
+Path MTU Discovery is enabled. Packets start at 1200 bytes and can grow to
+1452 bytes of UDP payload after successful probes. Windows and Linux sockets
+use probe mode to avoid fragmentation and stale kernel path MTU limits.
+Rejected oversized probes are treated as packet loss, allowing ngtcp2 to keep
+using the smaller working size.
+
 `flush()` waits for accepted data to complete its first UDP transmission, without
 waiting for an ACK or application receipt. `shutdown()` sends FIN after all
 accepted data while allowing further reads. A nonempty `read()` returns zero
@@ -85,6 +104,11 @@ Keep the connection alive while using its streams. Destruction of an unfinished
 stream requests RESET_STREAM and STOP_SENDING; destruction of a connection
 requests CONNECTION_CLOSE. Stop the context and await `run()` before releasing
 its execution scope. Stopping wakes pending connection and stream operations.
+Canceling `run()` or calling `stop()` sends a best-effort CONNECTION_CLOSE to
+each active peer before closing UDP. This cleanup is protected from cancellation
+and has a total 250 ms send budget; it does not wait for peer acknowledgement.
+Explicitly closed connections cache their close packet for retransmission when
+the peer continues sending during the closing period.
 Cancellation removes a pending waiter, but does not retract bytes already
 accepted by a write. A canceled handshake requests closure of its partial connection.
 

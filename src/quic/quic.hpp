@@ -61,8 +61,11 @@ public:
 
     static auto bind(ilias::IPEndpoint local, Config config) -> ilias::IoTask<QuicContext>;
 
+    // Cancellation/stop sends best-effort CONNECTION_CLOSE before closing UDP.
     auto run() -> ilias::IoTask<void>;
     auto stop() noexcept -> void;
+    // Resolve host:port and race IPv4/IPv6 TLS handshakes with a 250ms stagger.
+    auto connect(std::string address) -> ilias::IoTask<QuicConnection>;
     auto connect(ilias::IPEndpoint remote, std::string serverName) -> ilias::IoTask<QuicConnection>;
     auto accept() -> ilias::IoTask<QuicConnection>;
     auto localEndpoint() const -> ilias::IoResult<ilias::IPEndpoint>;

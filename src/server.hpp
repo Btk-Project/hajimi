@@ -92,7 +92,7 @@ public:
 private:
     auto runTcp() -> IoTask<void>;
     auto runQuic() -> IoTask<void>;
-    auto handleSession(DynStream stream, IPEndpoint remoteEndpoint) -> IoTask<void>;
+    auto handleSession(DynStream stream, IPEndpoint remoteEndpoint, std::string tag) -> IoTask<void>;
 
     Config mConfig;
     ilias::TaskScope *mScope = nullptr;

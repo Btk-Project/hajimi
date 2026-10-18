@@ -29,7 +29,7 @@ constexpr auto HAJIMI_STORAGE_SIZE = UINT16_MAX + HAJIMI_HEADER;
 constexpr auto HAJIMI_MAX_DATA_EXCHANGE = UINT16_MAX - sizeof(uint64_t);
 
 // The init window size of the stream
-constexpr auto HAJIMI_INIT_WINDOW_SIZE = size_t{1024} * 128;
+constexpr auto HAJIMI_INIT_WINDOW_SIZE = size_t{1024} * 256;
 
 // The header room size (larger than the header size for more safe)
 constexpr auto HAJIMI_HEADER_ROOM = HAJIMI_HEADER + sizeof(uint64_t) * 2;

@@ -8,6 +8,12 @@ option("quic")
     set_description("Enable QUIC transport")
 option_end()
 
+option("lto")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable Link Time Optimization")
+option_end()
+
 -- Update
 add_rules("plugin.compile_commands.autoupdate", {outputdir = "build", lsp = "clangd"})
 
@@ -23,9 +29,15 @@ if is_mode("debug") then
     add_requires("gtest")
 end
 
+-- Quic
 if has_config("quic") then
     includes("packages/ngtcp2-quic/xmake.lua")
     add_requires("ngtcp2-quic 1.25.0")
+end
+
+-- LTO
+if has_config("lto") then
+    set_policy("build.optimization.lto", true)
 end
 
 target("hajimi")

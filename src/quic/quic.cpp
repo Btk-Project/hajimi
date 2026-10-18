@@ -1,11 +1,13 @@
 #include "quic.hpp"
 #include "crypto.hpp"
+#include "../skbuf.hpp"
 #include "../utils.hpp"
 
 #include <ilias/sync.hpp>
 #include <openssl/rand.h>
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -39,7 +41,8 @@ public:
 
 const QuicErrorCategory quicErrorCategory;
 constexpr size_t cidLength = 16;
-constexpr size_t packetSize = 1200;
+constexpr size_t packetSize = 1452;
+constexpr size_t streamChunkSize = 16 * 1024;
 constexpr uint64_t abandonedError = 1;
 
 auto timestamp() -> ngtcp2_tstamp {
@@ -102,10 +105,12 @@ namespace quic {
 
 struct StreamState {
     struct Chunk {
-        std::vector<uint8_t> bytes;
+        SkBuffer bytes;
         uint64_t offset = 0;
     };
 
+    // Streams can outlive the context and still retain received data.
+    std::shared_ptr<SkBufferPool> pool;
     std::weak_ptr<ConnectionState> connection;
     int64_t id = -1;
     ilias::Event changed;
@@ -114,7 +119,6 @@ struct StreamState {
 
     std::deque<Chunk> rx;
     std::deque<Chunk> tx;
-    size_t rxHead = 0;
     size_t buffered = 0;
     uint64_t received = 0;
     uint64_t consumed = 0;
@@ -138,6 +142,7 @@ struct StreamState {
 };
 
 struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
+    std::shared_ptr<SkBufferPool> pool;
     std::weak_ptr<ContextState> context;
     IPEndpoint local;
     IPEndpoint remote;
@@ -159,6 +164,7 @@ struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
     bool draining = false;
     ngtcp2_tstamp retireAt = 0;
     ngtcp2_ccerr closeReason{};
+    SkBuffer closePacket;
     std::optional<uint64_t> appError;
     std::error_code error;
 
@@ -177,6 +183,8 @@ struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
 
 struct ContextState {
     QuicContext::Config config;
+    std::shared_ptr<SkBufferPool> pool = std::make_shared<SkBufferPool>(
+        std::initializer_list<SkBufferPool::ClassInfo>{{256, 128}, {2048, 32}, {16384, 8}, {65536, 2}});
     ilias::UdpSocket socket;
     IPEndpoint local;
     TlsContext tls;
@@ -196,6 +204,11 @@ struct ContextState {
         stopped = true;
         error = value;
         for (auto &connection : connections) {
+            if (!connection->error) {
+                connection->closeRequested = true;
+                connection->appError = 0;
+                ngtcp2_ccerr_set_application_error(&connection->closeReason, 0, nullptr, 0);
+            }
             connection->fail(value);
             connection->notify();
         }
@@ -236,7 +249,6 @@ auto StreamState::discardReceived(ConnectionState &conn, uint64_t finalSize) -> 
     conn.credit += finalSize - consumed;
     consumed = finalSize;
     rx.clear();
-    rxHead = 0;
 }
 
 auto StreamState::reset(uint64_t error) noexcept -> void {
@@ -266,6 +278,7 @@ auto ConnectionState::ensureStream(int64_t id) -> std::shared_ptr<StreamState> {
         return it->second;
     }
     auto stream = std::make_shared<StreamState>();
+    stream->pool = pool;
     stream->connection = shared_from_this();
     stream->id = id;
     streams.emplace(id, stream);
@@ -422,7 +435,9 @@ static auto callbacks() -> ngtcp2_callbacks {
                 return NGTCP2_ERR_CALLBACK_FAILURE;
             }
             if (size) {
-                stream->rx.push_back({std::vector<uint8_t>(bytes, bytes + size), offset});
+                auto buffer = stream->pool->allocate(size);
+                buffer.append(std::as_bytes(std::span{bytes, size}));
+                stream->rx.push_back({std::move(buffer), offset});
                 stream->received += size;
             }
             stream->readFin |= (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
@@ -505,6 +520,7 @@ static auto makeConnection(const std::shared_ptr<ContextState> &context, IPEndpo
         return Err(std::make_error_code(std::errc::no_buffer_space));
     }
     auto state = std::make_shared<ConnectionState>();
+    state->pool = context->pool;
     state->context = context;
     state->local = context->local;
     state->remote = remote;
@@ -523,7 +539,6 @@ static auto makeConnection(const std::shared_ptr<ContextState> &context, IPEndpo
     settings.initial_ts = timestamp();
     settings.handshake_timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(config.handshakeTimeout).count();
     settings.max_tx_udp_payload_size = packetSize;
-    settings.no_pmtud = 1;
     ngtcp2_transport_params params;
     ngtcp2_transport_params_default(&params);
     params.initial_max_data = config.connectionWindow;
@@ -630,12 +645,24 @@ static auto sendPackets(const std::shared_ptr<ContextState> &context,
     const std::shared_ptr<ConnectionState> &state) -> IoTask<void> {
     std::array<uint8_t, packetSize> packet;
     if (state->closeRequested && !state->draining) {
-        auto n = ngtcp2_conn_write_connection_close(state->conn, nullptr, nullptr,
-            packet.data(), packet.size(), &state->closeReason, timestamp());
-        state->closeRequested = false;
-        if (n > 0) {
-            ILIAS_CO_TRYV(co_await context->socket.sendto(ilias::makeBuffer(packet.data(), n), state->remote));
+        if (state->closePacket.empty()) {
+            auto buffer = state->pool->allocate(packetSize);
+            auto data = buffer.prepareBack(packetSize);
+            auto n = ngtcp2_conn_write_connection_close(state->conn, nullptr, nullptr,
+                reinterpret_cast<uint8_t *>(data.data()), data.size(), &state->closeReason, timestamp());
+            if (n < 0) {
+                co_return Err(transportError(static_cast<int>(n)));
+            }
+            if (n == 0) {
+                state->closeRequested = false;
+                co_return {};
+            }
+            buffer.commitBack(n);
+            state->closePacket = std::move(buffer);
         }
+        // ngtcp2 enters closing after encoding once; retransmit the cached packet.
+        ILIAS_CO_TRYV(co_await context->socket.sendto(ilias::makeBuffer(state->closePacket.data()), state->remote));
+        state->closeRequested = false;
         state->closeSent = true;
         if (!state->retireAt) {
             state->retireAt = timestamp() + 3 * ngtcp2_conn_get_pto2(state->conn);
@@ -665,7 +692,7 @@ static auto sendPackets(const std::shared_ptr<ContextState> &context,
             for (auto &chunk : stream->tx) {
                 if (chunk.offset + chunk.bytes.size() > stream->submitted) {
                     auto offset = static_cast<size_t>(stream->submitted - chunk.offset);
-                    vec.base = chunk.bytes.data() + offset;
+                    vec.base = reinterpret_cast<uint8_t *>(chunk.bytes.mutableData().data()) + offset;
                     vec.len = chunk.bytes.size() - offset;
                     break;
                 }
@@ -699,7 +726,12 @@ static auto sendPackets(const std::shared_ptr<ContextState> &context,
         if (n == 0) {
             break;
         }
-        ILIAS_CO_TRYV(co_await context->socket.sendto(ilias::makeBuffer(packet.data(), n), state->remote));
+        auto sent = co_await context->socket.sendto(ilias::makeBuffer(packet.data(), n), state->remote);
+        // A rejected MTU probe is a lost packet, not a failed UDP endpoint.
+        if (!sent && (sent.error() != ilias::SystemError::MessageTooLarge ||
+            dataSize >= 0 || n <= NGTCP2_MAX_UDP_PAYLOAD_SIZE)) {
+            co_return Err(sent.error());
+        }
         ngtcp2_conn_update_pkt_tx_time(state->conn, timestamp());
         if (selected && dataSize >= 0) {
             selected->sent = selected->submitted;
@@ -763,6 +795,18 @@ static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
     co_return {};
 }
 
+static auto closeConnections(std::shared_ptr<ContextState> state) -> ilias::Task<void> {
+    state->stop(std::make_error_code(std::errc::operation_canceled));
+    auto send = [&]() -> ilias::Task<void> {
+        for (auto &connection : state->connections) {
+            // Try every peer even if another connection cannot send its close.
+            auto _ = co_await sendPackets(state, connection);
+        }
+    };
+    // Finish notification even when run() was canceled, without delaying exit indefinitely.
+    auto _ = co_await ilias::unstoppable(ilias::timeout(send(), std::chrono::milliseconds{250}));
+}
+
 static auto runContext(std::shared_ptr<ContextState> state) -> IoTask<void> {
     if (!state || state->running || state->stopped) {
         co_return Err(std::make_error_code(std::errc::operation_not_permitted));
@@ -778,7 +822,8 @@ static auto runContext(std::shared_ptr<ContextState> state) -> IoTask<void> {
     }};
     // Keep one receive alive: racing recvfrom against a wakeup can discard
     // a datagram that completes at the same time as cancellation.
-    auto [received, sent] = co_await ilias::whenAny(receiveWorker(state), sendWorker(state));
+    auto [received, sent] = co_await (ilias::whenAny(receiveWorker(state), sendWorker(state)) |
+        ilias::finally(closeConnections(state)));
     if (received && !*received) {
         state->stop(received->error());
         co_return Err(received->error());
@@ -822,6 +867,19 @@ auto QuicContext::bind(IPEndpoint local, Config config) -> IoTask<QuicContext> {
     ilias::UdpBuilder builder{local.family()};
     if (local.family() == AF_INET6) {
         builder.option(ilias::sockopt::Ipv6Only{false});
+#if defined(_WIN32) || defined(__linux__)
+        // Let QUIC probe without IP fragmentation or a stale kernel path MTU.
+        builder.option(ilias::sockopt::OptionT<IPPROTO_IPV6, IPV6_MTU_DISCOVER, int>{IP_PMTUDISC_PROBE});
+#elif defined(IPV6_DONTFRAG)
+        builder.option(ilias::sockopt::OptionT<IPPROTO_IPV6, IPV6_DONTFRAG, int>{1});
+#endif
+    }
+    else {
+#if defined(_WIN32) || defined(__linux__)
+        builder.option(ilias::sockopt::OptionT<IPPROTO_IP, IP_MTU_DISCOVER, int>{IP_PMTUDISC_PROBE});
+#elif defined(IP_DONTFRAG)
+        builder.option(ilias::sockopt::OptionT<IPPROTO_IP, IP_DONTFRAG, int>{1});
+#endif
     }
     ILIAS_CO_TRY(state->socket, co_await builder.bind(local));
     ILIAS_CO_TRY(state->local, state->socket.localEndpoint());
@@ -843,6 +901,98 @@ auto QuicContext::localEndpoint() const -> IoResult<IPEndpoint> {
         return Err(std::make_error_code(std::errc::bad_file_descriptor));
     }
     return mState->local;
+}
+
+auto QuicContext::connect(std::string address) -> IoTask<QuicConnection> {
+    using namespace std::chrono_literals;
+    auto state = mState;
+    if (!state || state->config.role != Role::Client) {
+        co_return Err(std::make_error_code(std::errc::invalid_argument));
+    }
+    if (state->stopped) {
+        co_return Err(state->error);
+    }
+
+    auto separator = address.rfind(':');
+    if (separator == std::string::npos || separator == 0 || separator + 1 == address.size()) {
+        co_return Err(std::make_error_code(std::errc::invalid_argument));
+    }
+    auto host = address.substr(0, separator);
+    auto service = std::string_view(address).substr(separator + 1);
+    uint16_t port = 0;
+    auto [end, error] = std::from_chars(service.data(), service.data() + service.size(), port);
+    if (error != std::errc{} || end != service.data() + service.size() || port == 0) {
+        co_return Err(std::make_error_code(std::errc::invalid_argument));
+    }
+    if (host.starts_with('[') && host.ends_with(']')) {
+        host = host.substr(1, host.size() - 2);
+    }
+    else if (host.find_first_of(":[]") != std::string::npos) {
+        co_return Err(std::make_error_code(std::errc::invalid_argument));
+    }
+    if (host.empty()) {
+        co_return Err(std::make_error_code(std::errc::invalid_argument));
+    }
+
+    ilias::addrinfo_t hints{};
+    hints.ai_family = state->local.family() == AF_INET ? AF_INET : AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    hints.ai_flags = AI_NUMERICSERV;
+    ILIAS_CO_TRY(auto info, co_await ilias::AddressInfo::fromHostname(host, service, hints));
+    auto resolved = info.endpoints();
+    if (resolved.empty()) {
+        co_return Err(std::make_error_code(std::errc::host_unreachable));
+    }
+
+    // Preserve resolver preference within each family, interleaving IPv4 and IPv6.
+    std::array<std::deque<IPEndpoint>, 2> families;
+    for (auto endpoint : resolved) {
+        auto &family = families[endpoint.family() == AF_INET6];
+        if (std::find(family.begin(), family.end(), endpoint) == family.end()) {
+            family.push_back(endpoint);
+        }
+    }
+    std::vector<IPEndpoint> candidates;
+    size_t family = resolved.front().family() == AF_INET6;
+    while (!families[0].empty() || !families[1].empty()) {
+        if (!families[family].empty()) {
+            candidates.push_back(families[family].front());
+            families[family].pop_front();
+        }
+        family ^= 1;
+    }
+
+    ilias::TaskGroup<IoResult<QuicConnection>> attempts;
+    auto race = [&]() -> IoTask<QuicConnection> {
+        std::error_code lastError = std::make_error_code(std::errc::host_unreachable);
+        size_t next = 0;
+        while (next < candidates.size() || !attempts.empty()) {
+            if (!attempts.empty()) {
+                std::optional<IoResult<QuicConnection>> completed;
+                if (next < candidates.size()) {
+                    auto result = co_await ilias::timeout(attempts.next(), 250ms);
+                    if (result) { completed = std::move(*result); }
+                }
+                else {
+                    completed = co_await attempts.next();
+                }
+                if (completed) {
+                    if (*completed) {
+                        co_return std::move(**completed);
+                    }
+                    lastError = completed->error();
+                }
+            }
+            if (next < candidates.size()) {
+                // Every attempt verifies the original host, not its resolved address.
+                attempts.spawn(connect(candidates[next++], host));
+            }
+        }
+        co_return Err(lastError);
+    };
+    // Join canceled attempts before releasing the race's state, including on cancellation.
+    co_return co_await ilias::finally(race(), attempts.shutdown());
 }
 
 auto QuicContext::connect(IPEndpoint remote, std::string serverName) -> IoTask<QuicConnection> {
@@ -1012,14 +1162,13 @@ auto QuicStream::read(ilias::MutableBuffer buffer) -> IoTask<size_t> {
         }
         if (!state->rx.empty()) {
             auto &chunk = state->rx.front().bytes;
-            auto size = std::min(buffer.size(), chunk.size() - state->rxHead);
-            std::memcpy(buffer.data(), chunk.data() + state->rxHead, size);
-            state->rxHead += size;
+            auto size = std::min(buffer.size(), chunk.size());
+            std::memcpy(buffer.data(), chunk.data().data(), size);
+            chunk.consumeFront(size);
             state->consumed += size;
             state->credit += size;
-            if (state->rxHead == chunk.size()) {
+            if (chunk.empty()) {
                 state->rx.pop_front();
-                state->rxHead = 0;
             }
             if (auto connection = state->connection.lock()) {
                 connection->credit += size;
@@ -1059,11 +1208,12 @@ auto QuicStream::write(ilias::Buffer buffer) -> IoTask<size_t> {
         if (state->writeFin || state->closed) {
             co_return Err(std::make_error_code(std::errc::broken_pipe));
         }
-        auto size = std::min({buffer.size(), context->config.sendBufferLimit - state->buffered,
+        auto size = std::min({buffer.size(), streamChunkSize, context->config.sendBufferLimit - state->buffered,
             context->config.connectionSendBufferLimit - connection->buffered});
         if (size) {
-            auto bytes = reinterpret_cast<const uint8_t *>(buffer.data());
-            state->tx.push_back({std::vector<uint8_t>(bytes, bytes + size), state->accepted});
+            auto bytes = state->pool->allocate(size);
+            bytes.append(buffer.first(size));
+            state->tx.push_back({std::move(bytes), state->accepted});
             state->accepted += size;
             state->buffered += size;
             connection->buffered += size;

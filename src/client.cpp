@@ -110,28 +110,16 @@ auto ProxyClient::run() -> IoTask<void> {
 auto ProxyClient::connectOnce(bool &registered, void *quicContext) -> IoTask<void> {
     using namespace std::literals;
 
-    // Resolve the master address, it may be a domain name (re-resolve on each reconnect)
-    ILIAS_CO_TRY(auto info, co_await ilias::AddressInfo::lookup(mConfig.master));
-
 #ifdef HAJIMI_QUIC
     // Try quic first, other wise, fallback to tcp
     std::error_code lastErr;
     do {
-        if (mConfig.transport == "tcp" || !quicContext || info.endpoints().empty()) {
+        if (mConfig.transport == "tcp" || !quicContext) {
             break;
         }
         auto ctxt = static_cast<QuicContext *>(quicContext);
-        auto name = mConfig.master;
-        if (name.starts_with('[')) {
-            name = name.substr(1, name.find(']') - 1); // Unwrap an IPv6 literal.
-        }
-        else if (auto pos = name.rfind(':'); pos != std::string::npos) {
-            name.resize(pos); // Trim port
-        }
-
-        // TODO: HE2? for QUIC?, i use a silly way here
-        std::println("[ProxyClient] Connecting to master {} using QUIC...", name);
-        auto conn = co_await ctxt->connect(info.endpoints()[0], name);
+        std::println("[ProxyClient] Connecting to master {} using QUIC...", mConfig.master);
+        auto conn = co_await ctxt->connect(mConfig.master);
         if (!conn) { // Failed
             lastErr = conn.error();
             break;
@@ -151,6 +139,7 @@ auto ProxyClient::connectOnce(bool &registered, void *quicContext) -> IoTask<voi
 #endif // HAJIMI_QUIC
     
     std::println("[ProxyClient] Connecting to master {} using TCP...", mConfig.master);
+    ILIAS_CO_TRY(auto info, co_await ilias::AddressInfo::lookup(mConfig.master));
     ILIAS_CO_TRY(auto stream, co_await happy_eyeballs::connect(info.endpoints()));
     auto _ = stream.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
     co_return co_await runOnce(registered, stream);
