@@ -97,6 +97,48 @@ use probe mode to avoid fragmentation and stale kernel path MTU limits.
 Rejected oversized probes are treated as packet loss, allowing ngtcp2 to keep
 using the smaller working size.
 
+UDP batching is enabled by default. Packets are generated into a pooled block
+of at most 60 KiB, bounded by the connection's pacing quantum. Windows uses
+per-message UDP segmentation and parses receive-coalescing metadata. Linux
+uses UDP GSO/GRO with `sendmmsg`/`recvmmsg` as the non-segmented batch path.
+Unsupported segmentation falls back to the original datagram boundaries.
+Pending I/O retains its buffers, and `flush()` advances only for completed sends.
+An independent timer worker avoids rebuilding the expiry wait on every wakeup.
+
+Set `Config::udpBatching = false` for a single-datagram comparison.
+`ioStats()` reports datagrams, bytes, I/O submissions, segmentation/coalescing
+hits, drops, fallbacks, and maximum batch sizes. Submission counts are API
+operations, not measured syscall counts. An enabled coalescing option does not
+guarantee that a particular path actually delivers coalesced receives.
+
+The optional native benchmark transfers directly between two contexts on one
+executor, without the proxy protocol or a Node load generator:
+
+```sh
+xmake f -m release --quic=y
+xmake build quic-bench
+xmake run quic-bench batch 256
+xmake run quic-bench single 256
+```
+
+On Linux, measure the complete proxy in both directions, with direct TCP and
+TCP transport references (Python 3, loopback test certificates only):
+
+```sh
+python3 benchmarks/linux_proxy.py build/linux/x86_64/release/hajimi \
+    --output build/linux-proxy-results.json
+```
+
+The runner alternates transport order across rounds, warms up each connection,
+and records received throughput, per-process CPU time and UDP kernel counters.
+CPU time excludes the Python load generator. The native benchmark includes both
+QUIC endpoints in one process; the proxy runner sums the two proxy processes.
+
+The last argument is the transfer size in MiB. Compare alternating runs of the
+same optimized binary. `cyclesPerByte` is available on Windows and is zero on
+other platforms. See [implementation results](../../docs/quic-udp-batching-results.md)
+for measured gains and the remaining platform limitations.
+
 `flush()` waits for accepted data to complete its first UDP transmission, without
 waiting for an ACK or application receipt. `shutdown()` sends FIN after all
 accepted data while allowing further reads. A nonempty `read()` returns zero
@@ -122,3 +164,4 @@ TLS/ALPN validation, multiple connections and streams, backpressure, FIN/reset,
 cancellation, idle/handshake timeouts, IPv6, and relayed loss/reordering.
 
 Performance design draft: [Batched UDP send/receive](../../docs/quic-udp-batching-draft.md).
+Linux measurements and validation: [Linux performance report](../../docs/quic-linux-performance.md).

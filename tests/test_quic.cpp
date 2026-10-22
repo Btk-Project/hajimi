@@ -124,6 +124,59 @@ ILIAS_TEST(Quic, DuplexAndFin) {
     co_return;
 }
 
+ILIAS_TEST(Quic, BulkTransferWithBatchingAndFallback) {
+    for (bool batching : {false, true}) {
+        auto serverCfg = serverConfig();
+        auto clientCfg = clientConfig();
+        serverCfg.udpBatching = batching;
+        clientCfg.udpBatching = batching;
+        auto result = co_await withContexts(serverCfg, clientCfg,
+            [&](QuicContext &server, QuicContext &client) -> IoTask<void> {
+                auto [connected, accepted] = co_await ilias::whenAll(
+                    client.connect(server.localEndpoint().value(), "localhost"), server.accept());
+                ILIAS_CO_TRY(auto local, std::move(connected));
+                ILIAS_CO_TRY(auto peer, std::move(accepted));
+                ILIAS_CO_TRY(auto stream, co_await local.openStream());
+                std::string payload(4 * 1024 * 1024, 'b');
+                for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>(i % 251);
+                auto write = [&]() -> IoTask<void> {
+                    ILIAS_CO_TRYV(co_await stream.writeAll(ilias::makeBuffer(payload)));
+                    ILIAS_CO_TRYV(co_await stream.flush());
+                    co_return co_await stream.shutdown();
+                };
+                auto read = [&]() -> IoTask<void> {
+                    ILIAS_CO_TRY(auto incoming, co_await peer.acceptStream());
+                    std::array<char, 2577> bytes;
+                    size_t offset = 0;
+                    while (true) {
+                        ILIAS_CO_TRY(auto size, co_await incoming.read(ilias::makeBuffer(bytes)));
+                        if (!size) break;
+                        if (offset + size > payload.size()) co_return Err(std::make_error_code(std::errc::bad_message));
+                        EXPECT_EQ(std::string_view(bytes.data(), size), std::string_view(payload).substr(offset, size));
+                        offset += size;
+                    }
+                    EXPECT_EQ(offset, payload.size());
+                    co_return {};
+                };
+                auto [written, readResult] = co_await ilias::whenAll(write(), read());
+                ILIAS_CO_TRYV(std::move(written));
+                ILIAS_CO_TRYV(std::move(readResult));
+                auto stats = client.ioStats();
+                EXPECT_GT(stats.txDatagrams, 1000);
+                if (batching && stats.sendSegmentation) EXPECT_GT(stats.txSegmentedDatagrams, 0);
+                if (!batching) EXPECT_EQ(stats.maxTxBatch, 1);
+                if (stats.txSegmentedDatagrams) EXPECT_LT(stats.txSubmissions, stats.txDatagrams / 2);
+                auto prefix = batching ? "batch_" : "single_";
+                ::testing::Test::RecordProperty(std::string(prefix) + "tx_datagrams", std::to_string(stats.txDatagrams));
+                ::testing::Test::RecordProperty(std::string(prefix) + "tx_submissions", std::to_string(stats.txSubmissions));
+                ::testing::Test::RecordProperty(std::string(prefix) + "tx_max_batch", std::to_string(stats.maxTxBatch));
+                co_return {};
+            });
+        EXPECT_TRUE(result) << result.error().message();
+    }
+    co_return;
+}
+
 ILIAS_TEST(Quic, ConcurrentStreamsAndBackpressure) {
     auto server = serverConfig();
     auto client = clientConfig();

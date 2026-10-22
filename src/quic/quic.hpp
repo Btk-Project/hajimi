@@ -36,6 +36,23 @@ class QuicContext {
 public:
     enum class Role { Client, Server };
 
+    struct IoStats {
+        uint64_t txDatagrams = 0;
+        uint64_t txBytes = 0;
+        uint64_t txSubmissions = 0;
+        uint64_t txSegmentedDatagrams = 0;
+        uint64_t rxDatagrams = 0;
+        uint64_t rxBytes = 0;
+        uint64_t rxSubmissions = 0;
+        uint64_t rxCoalescedDatagrams = 0;
+        uint64_t droppedReceives = 0;
+        uint64_t segmentationFallbacks = 0;
+        size_t maxTxBatch = 0;
+        size_t maxRxBatch = 0;
+        bool sendSegmentation = false;
+        bool receiveCoalescing = false;
+    };
+
     struct Config {
         Role role = Role::Client;
         std::string alpn = "hajimi/1";
@@ -53,6 +70,7 @@ public:
         size_t connectionSendBufferLimit = 4 * 1024 * 1024;
         std::optional<std::array<unsigned char, 32>> psk;
         std::string pskIdentity = "hajimi/shared/v1";
+        bool udpBatching = true; // Disable to compare with the single-datagram path.
         // Buffer pool upstream; must outlive the context and all its connections and streams.
         std::pmr::memory_resource *memoryResource = std::pmr::get_default_resource();
     };
@@ -72,6 +90,7 @@ public:
     auto connect(ilias::IPEndpoint remote, std::string serverName) -> ilias::IoTask<QuicConnection>;
     auto accept() -> ilias::IoTask<QuicConnection>;
     auto localEndpoint() const -> ilias::IoResult<ilias::IPEndpoint>;
+    auto ioStats() const noexcept -> IoStats;
 private:
     explicit QuicContext(std::shared_ptr<quic::ContextState> state);
     std::shared_ptr<quic::ContextState> mState;

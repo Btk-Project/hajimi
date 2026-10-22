@@ -2,6 +2,7 @@
 #include "../skbuf.hpp"
 #include "crypto.hpp"
 #include "quic.hpp"
+#include "udp_batch.hpp"
 
 #include <ilias/sync.hpp>
 #include <ilias/task.hpp>
@@ -142,6 +143,17 @@ struct StreamState {
     auto reset(uint64_t error) noexcept -> void;
 };
 
+struct PacketBatch {
+    struct Receipt {
+        std::shared_ptr<StreamState> stream;
+        uint64_t offset = 0;
+        bool fin = false;
+    };
+    std::array<Receipt, UdpBatchSocket::maxSegments> receipts;
+    size_t count = 0;
+    bool padding = false;
+};
+
 struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
     std::shared_ptr<SkBufferPool> pool;
     std::weak_ptr<ContextState> context;
@@ -157,6 +169,7 @@ struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
     size_t streamCredit = 0;
     uint64_t credit = 0;
     int64_t nextStream = -1;
+    PacketBatch *writingBatch = nullptr; // Only set during synchronous packet generation.
     bool server = false;
     bool handshake = false;
     bool queued = false;
@@ -189,11 +202,14 @@ struct ContextState {
     std::shared_ptr<SkBufferPool> pool = std::make_shared<SkBufferPool>(
         std::initializer_list<SkBufferPool::ClassInfo>{{256, 128}, {2048, 32}, {16384, 8}, {65536, 2}},
         config.memoryResource);
-    ilias::UdpSocket socket;
+    UdpBatchSocket socket;
     IPEndpoint local;
     TlsContext tls;
     ilias::Event wake;
     ilias::Event changed;
+    ilias::Event timerChanged;
+    ngtcp2_tstamp deadline = UINT64_MAX;
+    ngtcp2_tstamp armedDeadline = 0;
     std::vector<std::shared_ptr<ConnectionState>> connections;
     std::deque<std::shared_ptr<ConnectionState>> incoming;
     std::map<std::string, std::weak_ptr<ConnectionState>> routes;
@@ -583,7 +599,7 @@ static auto makeConnection(const std::shared_ptr<ContextState> &context, IPEndpo
 }
 
 static auto receive(const std::shared_ptr<ContextState> &context, IPEndpoint remote,
-    const uint8_t *packet, size_t size) -> void {
+    const uint8_t *packet, size_t size, ngtcp2_tstamp now, unsigned int ecn) -> void {
     ngtcp2_version_cid cid{};
     if (ngtcp2_pkt_decode_version_cid(&cid, packet, size, cidLength) != 0) {
         return; // Ignore unrelated UDP traffic and malformed headers.
@@ -614,7 +630,10 @@ static auto receive(const std::shared_ptr<ContextState> &context, IPEndpoint rem
         .local = address(state->local),
         .remote = address(remote),
     };
-    state->handleError(ngtcp2_conn_read_pkt(state->conn, &path, nullptr, packet, size, timestamp()));
+    ngtcp2_pkt_info pi{};
+    pi.ecn = ecn;
+    now = std::max(now, ngtcp2_conn_get_timestamp(state->conn));
+    state->handleError(ngtcp2_conn_read_pkt(state->conn, &path, &pi, packet, size, now));
 }
 
 static auto applyStreamChanges(ConnectionState &state) -> void {
@@ -645,9 +664,61 @@ static auto applyStreamChanges(ConnectionState &state) -> void {
     }
 }
 
+static auto writePacket(ngtcp2_conn *, ngtcp2_path *path, ngtcp2_pkt_info *pi,
+    uint8_t *packet, size_t capacity, ngtcp2_tstamp now, void *data) noexcept -> ngtcp2_ssize {
+    auto &state = *static_cast<ConnectionState *>(data);
+    auto &batch = *state.writingBatch;
+    ngtcp2_ssize n = 0;
+    ngtcp2_ssize dataSize = -1;
+    std::shared_ptr<StreamState> selected;
+    auto it = state.streams.upper_bound(state.nextStream);
+    for (size_t checked = 0; checked < state.streams.size(); ++checked) {
+        if (it == state.streams.end()) it = state.streams.begin();
+        auto stream = (it++)->second;
+        state.nextStream = stream->id;
+        if (stream->writeError || stream->closed || stream->finSubmitted ||
+            (stream->submitted == stream->accepted && !stream->writeFin)) continue;
+
+        std::array<ngtcp2_vec, 16> vectors{};
+        size_t count = 0;
+        size_t available = 0;
+        for (auto &chunk : stream->tx) {
+            if (chunk.offset + chunk.bytes.size() <= stream->submitted) continue;
+            auto offset = stream->submitted > chunk.offset ? static_cast<size_t>(stream->submitted - chunk.offset) : 0;
+            vectors[count++] = {reinterpret_cast<uint8_t *>(chunk.bytes.mutableData().data()) + offset,
+                chunk.bytes.size() - offset};
+            available += chunk.bytes.size() - offset;
+            if (count == vectors.size()) break;
+        }
+        auto fin = stream->writeFin && stream->submitted + available == stream->accepted;
+        uint32_t flags = fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0;
+        if (batch.padding && available >= 1024) flags |= NGTCP2_WRITE_STREAM_FLAG_PADDING;
+        n = ngtcp2_conn_writev_stream(state.conn, path, pi, packet, capacity, &dataSize,
+            flags, stream->id, count ? vectors.data() : nullptr, count, now);
+        if (n == NGTCP2_ERR_STREAM_DATA_BLOCKED) continue;
+        if (n == NGTCP2_ERR_STREAM_SHUT_WR || n == NGTCP2_ERR_STREAM_NOT_FOUND) {
+            stream->writeError = make_error_code(QuicError::StreamReset);
+            continue;
+        }
+        selected = stream;
+        if (dataSize >= 0) {
+            stream->submitted += dataSize;
+            stream->finSubmitted = fin && static_cast<size_t>(dataSize) == available;
+        }
+        break;
+    }
+    if (!selected) {
+        n = ngtcp2_conn_writev_stream(state.conn, path, pi, packet, capacity, nullptr, 0, -1, nullptr, 0, now);
+    }
+    if (n > 0) {
+        auto &receipt = batch.receipts[batch.count++];
+        if (selected && dataSize >= 0) receipt = {selected, selected->submitted, selected->finSubmitted};
+    }
+    return n;
+}
+
 static auto sendPackets(const std::shared_ptr<ContextState> &context,
     const std::shared_ptr<ConnectionState> &state) -> IoTask<void> {
-    std::array<uint8_t, packetSize> packet;
     if (state->closeRequested && !state->draining) {
         if (state->closePacket.empty()) {
             auto buffer = state->pool->allocate(packetSize);
@@ -665,7 +736,8 @@ static auto sendPackets(const std::shared_ptr<ContextState> &context,
             state->closePacket = std::move(buffer);
         }
         // ngtcp2 enters closing after encoding once; retransmit the cached packet.
-        ILIAS_CO_TRYV(co_await context->socket.sendto(ilias::makeBuffer(state->closePacket.data()), state->remote));
+        auto closed = co_await context->socket.send(ilias::makeBuffer(state->closePacket.data()), state->remote, state->closePacket.size());
+        if (closed.error) co_return Err(closed.error);
         state->closeRequested = false;
         state->closeSent = true;
         if (!state->retireAt) {
@@ -677,90 +749,73 @@ static auto sendPackets(const std::shared_ptr<ContextState> &context,
         co_return {};
     }
     applyStreamChanges(*state);
-    for (size_t count = 0; count < 64 && !context->stopped && !state->error; ++count) {
-        ngtcp2_ssize n = 0;
-        ngtcp2_ssize dataSize = -1;
-        std::shared_ptr<StreamState> selected;
-        auto it = state->streams.upper_bound(state->nextStream);
-        for (size_t checked = 0; checked < state->streams.size(); ++checked) {
-            if (it == state->streams.end()) {
-                it = state->streams.begin();
-            }
-            auto stream = (it++)->second;
-            state->nextStream = stream->id;
-            if (stream->writeError || stream->closed || stream->finSubmitted ||
-                (stream->submitted == stream->accepted && !stream->writeFin)) {
-                continue;
-            }
-            ngtcp2_vec vec{};
-            for (auto &chunk : stream->tx) {
-                if (chunk.offset + chunk.bytes.size() > stream->submitted) {
-                    auto offset = static_cast<size_t>(stream->submitted - chunk.offset);
-                    vec.base = reinterpret_cast<uint8_t *>(chunk.bytes.mutableData().data()) + offset;
-                    vec.len = chunk.bytes.size() - offset;
-                    break;
-                }
-            }
-            auto fin = stream->writeFin && stream->submitted + vec.len == stream->accepted;
-            n = ngtcp2_conn_writev_stream(state->conn, nullptr, nullptr, packet.data(), packet.size(),
-                &dataSize, fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0, stream->id,
-                vec.len ? &vec : nullptr, vec.len ? 1 : 0, timestamp());
-            if (n == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
-                continue;
-            }
-            if (n == NGTCP2_ERR_STREAM_SHUT_WR || n == NGTCP2_ERR_STREAM_NOT_FOUND) {
-                stream->writeError = make_error_code(QuicError::StreamReset);
-                continue;
-            }
-            selected = stream;
-            if (dataSize >= 0) {
-                stream->submitted += dataSize;
-                stream->finSubmitted = fin && static_cast<size_t>(dataSize) == vec.len;
-            }
-            break;
-        }
-        if (!selected) {
-            n = ngtcp2_conn_writev_stream(state->conn, nullptr, nullptr, packet.data(), packet.size(),
-                nullptr, 0, -1, nullptr, 0, timestamp());
-        }
-        if (n < 0) {
-            state->handleError(static_cast<int>(n));
-            break;
-        }
-        if (n == 0) {
-            break;
-        }
-        auto sent = co_await context->socket.sendto(ilias::makeBuffer(packet.data(), n), state->remote);
-        // A rejected MTU probe is a lost packet, not a failed UDP endpoint.
-        if (!sent && (sent.error() != ilias::SystemError::MessageTooLarge ||
-            dataSize >= 0 || n <= NGTCP2_MAX_UDP_PAYLOAD_SIZE)) {
-            co_return Err(sent.error());
-        }
-        ngtcp2_conn_update_pkt_tx_time(state->conn, timestamp());
-        if (selected && dataSize >= 0) {
-            selected->sent = selected->submitted;
-            selected->finSent = selected->finSubmitted;
-        }
-        state->notify();
-        if (count == 63) {
-            context->wake.set(); // Continue later, allowing receives between batches.
+    if (state->error) co_return {};
+    // One bounded quantum per connection; all buffers survive asynchronous I/O.
+    auto buffer = state->pool->allocate(UdpBatchSocket::sendCapacity);
+    auto packet = buffer.prepareBack(UdpBatchSocket::sendCapacity);
+    PacketBatch batch;
+    batch.padding = context->config.udpBatching;
+    state->writingBatch = &batch;
+    auto limit = context->config.udpBatching ? std::clamp(ngtcp2_conn_get_send_quantum2(state->conn),
+        packetSize, UdpBatchSocket::sendCapacity) : packetSize;
+    size_t segment = 0;
+    ngtcp2_pkt_info pi{};
+    auto n = ngtcp2_conn_write_aggregate_pkt2(state->conn, nullptr, &pi,
+        reinterpret_cast<uint8_t *>(packet.data()), limit, &segment, writePacket,
+        context->config.udpBatching ? UdpBatchSocket::maxSegments : 1, timestamp());
+    state->writingBatch = nullptr;
+    if (n < 0) {
+        state->handleError(static_cast<int>(n));
+        co_return {};
+    }
+    if (n == 0) co_return {};
+    auto sent = co_await context->socket.send(ilias::makeBuffer(packet.data(), n), state->remote, segment, pi.ecn);
+    for (size_t i = 0; i < sent.datagrams; ++i) {
+        auto &receipt = batch.receipts[i];
+        if (receipt.stream) {
+            receipt.stream->sent = std::max(receipt.stream->sent, receipt.offset);
+            receipt.stream->finSent |= receipt.fin;
         }
     }
+    // A rejected MTU probe is a lost packet, not a failed UDP endpoint.
+    if (sent.error && (sent.error != ilias::SystemError::MessageTooLarge ||
+        batch.count != 1 || batch.receipts[0].stream || n <= NGTCP2_MAX_UDP_PAYLOAD_SIZE)) {
+        state->notify();
+        co_return Err(sent.error);
+    }
+    ngtcp2_conn_update_pkt_tx_time(state->conn, timestamp());
+    state->notify();
     co_return {};
 }
 
 static auto receiveWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
     auto token = co_await ilias::this_coro::stopToken();
-    std::array<uint8_t, 65536> packet;
+    size_t handled = 0;
+    auto turn = timestamp();
     while (!state->stopped && !token.stop_requested()) {
-        ILIAS_CO_TRY(auto received, co_await state->socket.recvfrom(ilias::makeBuffer(packet)));
+        ILIAS_CO_TRY(auto received, co_await state->socket.receive());
         if (state->stopped || token.stop_requested()) {
             break;
         }
-        auto [size, remote] = received;
-        receive(state, remote, packet.data(), size);
+        auto now = timestamp();
+        size_t count = 0;
+        for (auto &message : received) {
+            auto remaining = message.bytes;
+            do {
+                auto size = message.segmentSize ? std::min(message.segmentSize, remaining.size()) : remaining.size();
+                receive(state, message.remote, reinterpret_cast<const uint8_t *>(remaining.data()), size, now, message.ecn);
+                remaining = remaining.subspan(size);
+                if (++count % 32 == 0) now = timestamp();
+            } while (!remaining.empty());
+        }
         state->notify();
         state->wake.set();
+        handled += count;
+        if (handled >= 32 && (handled >= 1024 || timestamp() - turn >= 250 * NGTCP2_MICROSECONDS)) {
+            co_await ilias::this_coro::yield();
+            handled = 0;
+            turn = timestamp();
+        }
     }
     co_return {};
 }
@@ -773,7 +828,9 @@ static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
         state->removeExpired(now);
         // Application coroutines may add connections while sendto is suspended.
         auto connections = state->connections;
+        auto turn = now;
         for (auto &connection : connections) {
+            now = timestamp();
             if (!connection->error && ngtcp2_conn_get_expiry2(connection->conn) <= now) {
                 connection->handleError(ngtcp2_conn_handle_expiry(connection->conn, now));
             }
@@ -781,6 +838,10 @@ static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
             if (!sent) {
                 state->stop(sent.error());
                 co_return Err(sent.error());
+            }
+            if (timestamp() - turn >= 250 * NGTCP2_MICROSECONDS) {
+                co_await ilias::this_coro::yield();
+                turn = timestamp();
             }
         }
         state->notify();
@@ -792,9 +853,32 @@ static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
             deadline = std::min(deadline, connection->retireAt ? connection->retireAt :
                 ngtcp2_conn_get_expiry2(connection->conn));
         }
-        now = timestamp();
+        state->deadline = deadline;
+        if (!state->armedDeadline || deadline < state->armedDeadline) state->timerChanged.set();
+        co_await state->wake.wait();
+    }
+    co_return {};
+}
+
+static auto timerWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
+    auto token = co_await ilias::this_coro::stopToken();
+    while (!state->stopped && !token.stop_requested()) {
+        state->timerChanged.clear();
+        auto deadline = state->deadline;
+        if (deadline == UINT64_MAX) {
+            co_await state->timerChanged.wait();
+            continue;
+        }
+        state->armedDeadline = deadline;
+        auto now = timestamp();
         auto delay = std::chrono::nanoseconds(deadline > now ? deadline - now : 0);
-        co_await ilias::whenAny(state->wake.wait(), ilias::sleep(delay));
+        auto [changed, expired] = co_await ilias::whenAny(state->timerChanged.wait(), ilias::sleep(delay));
+        if (expired && !state->stopped && !token.stop_requested()) {
+            // Wait for the sender to publish a fresh deadline before arming again.
+            state->armedDeadline = 0;
+            state->wake.set();
+            co_await state->timerChanged.wait();
+        }
     }
     co_return {};
 }
@@ -826,7 +910,7 @@ static auto runContext(std::shared_ptr<ContextState> state) -> IoTask<void> {
     }};
     // Keep one receive alive: racing recvfrom against a wakeup can discard
     // a datagram that completes at the same time as cancellation.
-    auto [received, sent] = co_await (ilias::whenAny(receiveWorker(state), sendWorker(state)) |
+    auto [received, sent, timer] = co_await (ilias::whenAny(receiveWorker(state), sendWorker(state), timerWorker(state)) |
         ilias::finally(closeConnections(state)));
     if (received && !*received) {
         state->stop(received->error());
@@ -868,24 +952,25 @@ auto QuicContext::bind(IPEndpoint local, Config config) -> IoTask<QuicContext> {
     }
     auto state = std::make_shared<quic::ContextState>(std::move(config));
     ILIAS_CO_TRY(state->tls, quic::makeTlsContext(state->config));
-    ilias::UdpBuilder builder{local.family()};
+    ILIAS_CO_TRY(auto socket, ilias::Socket::make(local.family(), SOCK_DGRAM, IPPROTO_UDP));
     if (local.family() == AF_INET6) {
-        builder.option(ilias::sockopt::Ipv6Only{false});
+        ILIAS_CO_TRYV(socket.setOption(ilias::sockopt::Ipv6Only{false}));
 #if defined(_WIN32) || defined(__linux__)
         // Let QUIC probe without IP fragmentation or a stale kernel path MTU.
-        builder.option(ilias::sockopt::OptionT<IPPROTO_IPV6, IPV6_MTU_DISCOVER, int>{IP_PMTUDISC_PROBE});
+        ILIAS_CO_TRYV(socket.setOption(ilias::sockopt::OptionT<IPPROTO_IPV6, IPV6_MTU_DISCOVER, int>{IP_PMTUDISC_PROBE}));
 #elif defined(IPV6_DONTFRAG)
-        builder.option(ilias::sockopt::OptionT<IPPROTO_IPV6, IPV6_DONTFRAG, int>{1});
+        ILIAS_CO_TRYV(socket.setOption(ilias::sockopt::OptionT<IPPROTO_IPV6, IPV6_DONTFRAG, int>{1}));
 #endif
     }
     else {
 #if defined(_WIN32) || defined(__linux__)
-        builder.option(ilias::sockopt::OptionT<IPPROTO_IP, IP_MTU_DISCOVER, int>{IP_PMTUDISC_PROBE});
+        ILIAS_CO_TRYV(socket.setOption(ilias::sockopt::OptionT<IPPROTO_IP, IP_MTU_DISCOVER, int>{IP_PMTUDISC_PROBE}));
 #elif defined(IP_DONTFRAG)
-        builder.option(ilias::sockopt::OptionT<IPPROTO_IP, IP_DONTFRAG, int>{1});
+        ILIAS_CO_TRYV(socket.setOption(ilias::sockopt::OptionT<IPPROTO_IP, IP_DONTFRAG, int>{1}));
 #endif
     }
-    ILIAS_CO_TRY(state->socket, co_await builder.bind(local));
+    ILIAS_CO_TRYV(socket.bind(local));
+    ILIAS_CO_TRY(state->socket, quic::UdpBatchSocket::from(std::move(socket), state->config.udpBatching));
     ILIAS_CO_TRY(state->local, state->socket.localEndpoint());
     co_return QuicContext{std::move(state)};
 }
@@ -905,6 +990,10 @@ auto QuicContext::localEndpoint() const -> IoResult<IPEndpoint> {
         return Err(std::make_error_code(std::errc::bad_file_descriptor));
     }
     return mState->local;
+}
+
+auto QuicContext::ioStats() const noexcept -> IoStats {
+    return mState ? mState->socket.stats() : IoStats{};
 }
 
 auto QuicContext::connect(std::string address) -> IoTask<QuicConnection> {
@@ -1274,7 +1363,7 @@ auto QuicStream::shutdown() -> IoTask<void> {
 
 auto QuicStream::reset(uint64_t appError) noexcept -> void {
     if (mState) {
-        mState->reset(std::min(appError, NGTCP2_MAX_VARINT));
+        mState->reset(std::min<uint64_t>(appError, NGTCP2_MAX_VARINT));
     }
 }
 

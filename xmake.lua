@@ -70,3 +70,13 @@ target("hajimi")
         add_tests("unit", {runargs = {"--test"}, timeout = 60000})
     end
 target_end()
+
+-- Benchmark for quic
+if has_config("quic") then
+    target("quic-bench")
+        set_kind("binary")
+        set_default(false)
+        add_packages("ilias", "ngtcp2-quic")
+        add_files("benchmarks/quic.cpp", "src/quic/*.cpp")
+    target_end()
+end

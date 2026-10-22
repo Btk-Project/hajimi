@@ -15,6 +15,20 @@ using ilias::TcpListener;
 using ilias::TcpStream;
 using ilias::IoTask;
 
+ILIAS_TEST(Hajimi, CompletedChildBeforeScopeExit) {
+    co_await ilias::TaskScope::enter([](ilias::TaskScope &scope) -> ilias::Task<void> {
+        bool completed = false;
+        scope.spawn([&]() -> ilias::Task<void> {
+            co_await ilias::this_coro::yield();
+            completed = true;
+        });
+        // The scope has no completion waiter while its body is still running.
+        co_await ilias::sleep(10ms);
+        EXPECT_TRUE(completed);
+        EXPECT_TRUE(scope.empty());
+    });
+}
+
 // Smoke test for the client and server
 ILIAS_TEST(Hajimi, Smoke) {
     ProxyServer server {
