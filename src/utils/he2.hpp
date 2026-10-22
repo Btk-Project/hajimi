@@ -8,15 +8,6 @@
 #include <vector>
 #include <print>
 
-// ScopeExit
-template <typename Fn>
-class ScopeExit {
-public:
-    ScopeExit(Fn fn) : mFn(fn) {}
-    ~ScopeExit() { mFn(); }
-private:
-    Fn mFn;
-};
 
 // Use HE2.0
 namespace happy_eyeballs {

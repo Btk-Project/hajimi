@@ -199,6 +199,10 @@
       <div class="stat-label">活跃转发规则 (Rules)</div>
       <div class="stat-val" id="stat-rules-count">0</div>
     </div>
+    <div class="stat-card">
+      <div class="stat-label">内存池已分配内存</div>
+      <div class="stat-val" id="stat-memory-usage">-</div>
+    </div>
     <div class="stat-card" id="card-duckdns" style="display: none;">
       <div class="stat-label">🦆 DuckDNS 动态域名</div>
       <div class="stat-val" id="stat-duckdns-domain" style="font-size: 16px; word-break: break-all;">-</div>
@@ -356,6 +360,7 @@
     document.getElementById("stat-webui-port").textContent = (data.webui_host || "") + ":" + (data.webui_port || "-");
     document.getElementById("stat-clients-count").textContent = (data.clients || []).length;
     document.getElementById("stat-rules-count").textContent = (data.rules || []).length;
+    document.getElementById("stat-memory-usage").textContent = formatBytes(data.memory_usage);
     document.getElementById("uptime-text").textContent = "运行时间: " + formatSeconds(data.uptime_seconds || 0);
 
     // Update DuckDNS card

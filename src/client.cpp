@@ -9,11 +9,12 @@
 #include <print>
 #include <map>
 
+#include "utils/scope_exit.hpp"
+#include "utils/he2.hpp"
 #include "protocol.hpp"
 #include "client.hpp"
 #include "tunnel.hpp"
 #include "skbuf.hpp"
-#include "utils.hpp"
 
 #ifdef HAJIMI_QUIC
     #include "quic/quic.hpp"

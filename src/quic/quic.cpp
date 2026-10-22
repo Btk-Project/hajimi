@@ -1,9 +1,10 @@
-#include "quic.hpp"
-#include "crypto.hpp"
+#include "../utils/scope_exit.hpp"
 #include "../skbuf.hpp"
-#include "../utils.hpp"
+#include "crypto.hpp"
+#include "quic.hpp"
 
 #include <ilias/sync.hpp>
+#include <ilias/task.hpp>
 #include <openssl/rand.h>
 #include <algorithm>
 #include <array>
@@ -182,9 +183,12 @@ struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
 };
 
 struct ContextState {
+    explicit ContextState(QuicContext::Config value) : config(std::move(value)) {}
+
     QuicContext::Config config;
     std::shared_ptr<SkBufferPool> pool = std::make_shared<SkBufferPool>(
-        std::initializer_list<SkBufferPool::ClassInfo>{{256, 128}, {2048, 32}, {16384, 8}, {65536, 2}});
+        std::initializer_list<SkBufferPool::ClassInfo>{{256, 128}, {2048, 32}, {16384, 8}, {65536, 2}},
+        config.memoryResource);
     ilias::UdpSocket socket;
     IPEndpoint local;
     TlsContext tls;
@@ -858,11 +862,11 @@ auto QuicContext::bind(IPEndpoint local, Config config) -> IoTask<QuicContext> {
         config.idleTimeout.count() <= 0 || config.maxConnections == 0 || config.maxStreams == 0 ||
         config.maxStreams > (NGTCP2_MAX_VARINT / 4) || config.streamWindow == 0 ||
         config.connectionWindow == 0 || config.sendBufferLimit == 0 || config.connectionSendBufferLimit == 0 ||
-        config.streamWindow > NGTCP2_MAX_VARINT || config.connectionWindow > NGTCP2_MAX_VARINT) {
+        config.streamWindow > NGTCP2_MAX_VARINT || config.connectionWindow > NGTCP2_MAX_VARINT ||
+        !config.memoryResource) {
         co_return Err(std::make_error_code(std::errc::invalid_argument));
     }
-    auto state = std::make_shared<quic::ContextState>();
-    state->config = std::move(config);
+    auto state = std::make_shared<quic::ContextState>(std::move(config));
     ILIAS_CO_TRY(state->tls, quic::makeTlsContext(state->config));
     ilias::UdpBuilder builder{local.family()};
     if (local.family() == AF_INET6) {

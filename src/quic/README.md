@@ -84,6 +84,11 @@ Receive credit is returned when data is consumed or discarded.
 
 Stream RX/TX data uses `SkBufferPool`, with writes split into at most 16 KiB
 chunks. Buffers retain their pool if a stream outlives its connection or context.
+Set `Config::memoryResource` to customize or track buffer pool allocations; it
+defaults to `std::pmr::get_default_resource()` and must not be null. The resource
+must outlive the context and all its connections and streams. This setting covers
+the buffer pool, not ngtcp2/TLS allocations or other wrapper containers. The proxy
+server passes its allocation tracker so these buffers contribute to WebUI memory usage.
 Connection lists and iteration snapshots remain vectors of handles.
 
 Path MTU Discovery is enabled. Packets start at 1200 bytes and can grow to
@@ -115,3 +120,5 @@ accepted by a write. A canceled handshake requests closure of its partial connec
 Tests use random loopback ports and public test-only certificates. They cover
 TLS/ALPN validation, multiple connections and streams, backpressure, FIN/reset,
 cancellation, idle/handshake timeouts, IPv6, and relayed loss/reordering.
+
+Performance design draft: [Batched UDP send/receive](../../docs/quic-udp-batching-draft.md).

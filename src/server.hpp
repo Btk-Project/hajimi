@@ -10,6 +10,7 @@
 #include <memory>
 #include <map>
 
+#include "utils/allocator.hpp"
 #include "duckdns.hpp"
 
 // Import
@@ -94,7 +95,9 @@ private:
     auto runQuic() -> IoTask<void>;
     auto handleSession(DynStream stream, IPEndpoint remoteEndpoint, std::string tag) -> IoTask<void>;
 
+
     Config mConfig;
+    AllocationTracker mTracker;
     ilias::TaskScope *mScope = nullptr;
     std::optional<DuckDnsUpdater> mDuckDns; // DuckDns updater, nullopt if ddns is disabled
     std::chrono::steady_clock::time_point mStartTime; // timestamp of inited

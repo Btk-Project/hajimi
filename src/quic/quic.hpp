@@ -5,6 +5,7 @@
 #include <chrono>
 #include <array>
 #include <memory>
+#include <memory_resource>
 #include <optional>
 #include <string>
 
@@ -52,6 +53,8 @@ public:
         size_t connectionSendBufferLimit = 4 * 1024 * 1024;
         std::optional<std::array<unsigned char, 32>> psk;
         std::string pskIdentity = "hajimi/shared/v1";
+        // Buffer pool upstream; must outlive the context and all its connections and streams.
+        std::pmr::memory_resource *memoryResource = std::pmr::get_default_resource();
     };
 
     QuicContext(const QuicContext &) = delete;

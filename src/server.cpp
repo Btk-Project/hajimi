@@ -9,11 +9,11 @@
 #include <atomic>
 #include <print>
 
+#include "utils/scope_exit.hpp"
 #include "protocol.hpp"
 #include "duckdns.hpp"
 #include "tunnel.hpp"
 #include "server.hpp"
-#include "utils.hpp"
 #include "web.hpp"
 
 #ifdef HAJIMI_QUIC
@@ -176,6 +176,7 @@ auto ProxyServer::runQuic() -> IoTask<void> {
             .role = QuicContext::Role::Server,
             .certFile = mConfig.certFile,
             .keyFile = mConfig.keyFile,
+            .memoryResource = &mTracker,
         }
     ));
 
@@ -202,7 +203,7 @@ auto ProxyServer::runQuic() -> IoTask<void> {
 #endif // HAJIMI_QUIC
 
 auto ProxyServer::handleSession(DynStream stream, IPEndpoint remoteEndpoint, std::string tag) -> IoTask<void> {
-    SkBufferPool pool{HAJIMI_POOL_CONFIG};
+    SkBufferPool pool{HAJIMI_POOL_CONFIG, &mTracker};
     MessageReader reader{stream, pool};
     MessageWriter writer{stream, pool};
 
@@ -344,6 +345,7 @@ auto ProxyServer::status() const -> std::string {
         {"clients", std::move(clients)},
         {"rules", std::move(rules)},
         {"duckdns", std::move(duckdns)},
+        {"memory_usage", mTracker.allocated()}
     };
 
     // return {
