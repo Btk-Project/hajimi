@@ -27,8 +27,10 @@ DuckDnsUpdater::DuckDnsUpdater(std::string_view domain, std::string_view token, 
 DuckDnsUpdater::~DuckDnsUpdater() = default;
 
 auto DuckDnsUpdater::run() -> Task<void> {
+    using namespace std::literals;
     while (true) {
-        auto res = co_await updateOnce();
+        auto val = co_await ilias::timeout(updateOnce(), 15s);
+        auto res = val.value_or(ilias::Err(std::make_error_code(std::errc::timed_out))); // Flattern the error
         if (!res) {
             std::println("[DuckDns] Update failed => {}", res.error().message());
             mStatus = std::format("Update failed: {}", res.error().message());
