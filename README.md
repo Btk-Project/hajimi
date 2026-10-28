@@ -103,3 +103,32 @@ hajimi --connect "myhome.duckdns.org:8000" --transport quic --ca-file "ca.pem"
 | `src/web.cpp` / `static/index.html` | WebUI 与 HTTP API |
 | `src/duckdns.cpp` | DuckDNS 更新 |
 | `src/utils.hpp` | ScopeExit、Happy Eyeballs 连接 |
+
+## 桌面 GUI
+
+```sh
+xmake f -y -m debug --quic=y --enable-gui=y --qt=/usr
+xmake build hajimi-gui
+xmake run hajimi-gui
+```
+
+将 `--qt` 改为本机包含 QtWebEngine QML 模块的 Qt 6 SDK 路径。GUI 与 CLI 一起构建，复用同一后端。
+
+- **WebUI**：手动填写服务端网页地址；未指定端口时使用 `8848`。
+- **连接**：分别新增反向代理或正向代理卡片，可同时运行多张卡片，每张卡片独立配置、启动、停止和查看日志，配置自动保存，重启后不会自动连接。
+- **右上角 ⋯ 菜单**：提供 DuckDNS 与 Tailscale 地址的复制、填入和本机网络检查。它们仅是可能可用的路径，不会自动选择或保证可达。
+
+对应命令示例：
+
+```sh
+# 将本机注册为 arch，供 WebUI 规则或其他客户端访问。
+hajimi --connect busystudent-pi.duckdns.org:1145 --name arch
+
+# 将本地端口转发到 arch 的 25565 端口。
+hajimi --connect 100.77.21.111:1145 --name forward-game --transport quic \
+    --forward 127.0.0.1:25565@arch:25565
+```
+
+同一服务端的各连接需要不同名称。传输可选 `auto`、`tcp`、`quic`；证书选项对应 `--ca-file` 和 `--insecure`，默认保持验证。
+
+Qt Creator 可用根目录 CMakeLists.txt 构建 GUI；先用 xmake 构建 CLI，或通过 `HAJIMI_CLI_EXECUTABLE` 指定已有 CLI。详细说明见 [桌面客户端](docs/client_design.md)。

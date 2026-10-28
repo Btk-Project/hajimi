@@ -1,3 +1,7 @@
+#include <ranges>
+#include <algorithm>
+#include <charconv>
+#include <cctype>
 #include <nlohmann/json.hpp>
 #include <ilias/macros.hpp>
 #include <ilias/task.hpp>
@@ -83,13 +87,22 @@ auto WebUi::handleIncoming(Stream stream) -> IoTask<void> {
             if (line.empty()) {
                 break;
             }
-            if (line.starts_with("Connection: ") && line.ends_with("close")) {
+            const auto colon = line.find(':');
+            if (colon == std::string::npos) {
+                continue;
+            }
+            // HTTP field names are case-insensitive; browsers may send lowercase names.
+            auto name = line.substr(0, colon);
+            std::ranges::transform(name, name.begin(), [](unsigned char ch) { return std::tolower(ch); });
+            auto value = std::string_view(line).substr(colon + 1);
+            const auto start = value.find_first_not_of(" \t");
+            value.remove_prefix(start == std::string_view::npos ? value.size() : start);
+            if (name == "connection" && value == "close") {
                 keepAlive = false;
             }
-            else if (line.starts_with("Content-Length: ")) {
-                auto numStr = std::string_view{line}.substr(16);
+            else if (name == "content-length") {
                 auto len = size_t{0};
-                if (std::from_chars(numStr.data(), numStr.data() + numStr.size(), len).ec != std::errc{}) {
+                if (std::from_chars(value.data(), value.data() + value.size(), len).ec != std::errc{}) {
                     break;
                 }
                 contentLength = len;
@@ -97,7 +110,7 @@ auto WebUi::handleIncoming(Stream stream) -> IoTask<void> {
         }
 
         // Read the content
-        if (contentLength && contentLength != 0) {
+        if (contentLength && *contentLength != 0) {
             content.resize(*contentLength);
             ILIAS_CO_TRYV(co_await stream.readAll(ilias::makeBuffer(content)));
         }

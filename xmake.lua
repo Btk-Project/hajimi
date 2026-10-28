@@ -40,11 +40,24 @@ if has_config("lto") then
     set_policy("build.optimization.lto", true)
 end
 
+option("enable-gui")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable GUI mode, needs Qt 6 and the QtWebEngine QML module")
+option_end()
+
 target("hajimi")
     set_kind("binary")
     add_packages("ilias")
     add_packages("nlohmann_json", "argparse")
     add_files("src/*.cpp")
+    on_load(function (target)
+        -- Allow the GUI to launch a shared ilias build without xmake's environment.
+        local runtime = target:pkg("ilias")
+        if runtime then
+            target:add("rpathdirs", path.join(runtime:installdir(), "lib"))
+        end
+    end)
 
     if has_config("quic") then
         add_packages("ngtcp2-quic")
@@ -78,5 +91,14 @@ if has_config("quic") then
         set_default(false)
         add_packages("ilias", "ngtcp2-quic")
         add_files("benchmarks/quic.cpp", "src/quic/*.cpp")
+    target_end()
+end
+
+if has_config("enable-gui") then
+    target("hajimi-gui")
+        add_rules("qt.quickapp")
+        add_deps("hajimi")
+        add_files("client/*.cpp", "client/*.hpp", "client/qml.qrc")
+        add_frameworks("QtQuick", "QtCore", "QtQml", "QtNetwork")
     target_end()
 end

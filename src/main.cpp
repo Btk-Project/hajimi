@@ -10,11 +10,14 @@
 #include <sstream>
 #include <ranges>
 #include <print>
+#include <cstdio>
 
 #include "server.hpp"
 #include "client.hpp"
 
 int ilias_main(int argc, char **argv) try {
+    // Keep CLI output visible when launched with a GUI process pipe.
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
     argparse::ArgumentParser parser{"hajimi"};
 
     parser.add_description("Hajimi - Asyncio Reverse Proxy, ilias runtime version: " ILIAS_VERSION_STRING);

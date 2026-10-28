@@ -1,0 +1,7 @@
+<RCC>
+    <qresource prefix="/qml">
+        <file alias="main.qml">qml/main.qml</file>
+        <file alias="ConnectionCard.qml">qml/ConnectionCard.qml</file>
+        <file alias="WebUiPage.qml">qml/WebUiPage.qml</file>
+    </qresource>
+</RCC>
