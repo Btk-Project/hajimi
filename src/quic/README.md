@@ -82,8 +82,10 @@ to accept an entire buffer; the wrapper retains unacknowledged data for
 retransmission. Per-stream and per-connection limits bound these queues.
 Receive credit is returned when data is consumed or discarded.
 
-Stream RX/TX data uses `SkBufferPool`, with writes split into at most 16 KiB
-chunks. Buffers retain their pool if a stream outlives its connection or context.
+Stream RX/TX data and UDP packet buffers share one `SkBufferPool`, with writes
+split into at most 16 KiB chunks. UDP receive slots allocate once and reuse their
+buffers; received views remain valid until the next receive. Stream buffers retain
+their pool if a stream outlives its connection or context.
 Set `Config::memoryResource` to customize or track buffer pool allocations; it
 defaults to `std::pmr::get_default_resource()` and must not be null. The resource
 must outlive the context and all its connections and streams. This setting covers

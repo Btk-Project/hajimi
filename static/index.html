@@ -229,7 +229,7 @@
         </div>
         <div class="form-group">
           <label>客户端内网地址</label>
-          <input type="text" id="f-target-host" class="form-control" value="127.0.0.1" required>
+          <input type="text" id="f-target-host" class="form-control" value="localhost" required>
         </div>
         <div class="form-group">
           <label>客户端目标端口 (Target Port)</label>
@@ -444,7 +444,7 @@
     e.preventDefault();
     const listenPort = parseInt(document.getElementById("f-listen-port").value);
     const clientName = document.getElementById("f-client-name").value;
-    const targetHost = document.getElementById("f-target-host").value.trim() || "127.0.0.1";
+    const targetHost = document.getElementById("f-target-host").value.trim() || "localhost";
     const targetPort = parseInt(document.getElementById("f-target-port").value);
 
     if (!listenPort || !clientName || !targetPort) {

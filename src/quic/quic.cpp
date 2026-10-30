@@ -10,11 +10,11 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cassert>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <print>
-#include <stop_token>
 #include <utility>
 
 using ilias::Err;
@@ -86,15 +86,9 @@ auto callback(Fn fn) noexcept -> int {
     }
 }
 
-auto waitChanged(ilias::Event &event, std::stop_token token) -> IoTask<void> {
+auto waitChanged(ilias::Event &event) {
     event.clear();
-    if (!token.stop_requested()) {
-        co_await event.wait();
-    }
-    if (token.stop_requested()) {
-        co_return Err(std::make_error_code(std::errc::operation_canceled));
-    }
-    co_return {};
+    return event.wait();
 }
 
 } // namespace
@@ -358,7 +352,7 @@ auto ConnectionState::handleError(int value) -> void {
         fail(make_error_code(tlsError ? QuicError::Tls : QuicError::ConnectionClosed));
     }
     else {
-        if (value == NGTCP2_ERR_CRYPTO && tls && tls->ssl) {
+        if (value == NGTCP2_ERR_CRYPTO) {
             auto result = SSL_get_verify_result(tls->ssl);
             if (result != X509_V_OK) {
                 std::println(stderr, "[QUIC] Certificate verification failed: {}",
@@ -451,9 +445,7 @@ static auto callbacks() -> ngtcp2_callbacks {
         const uint8_t *bytes, size_t size, void *data, void *) -> int {
         return callback([&]() {
             auto stream = static_cast<ConnectionState *>(data)->ensureStream(id);
-            if (offset != stream->received) {
-                return NGTCP2_ERR_CALLBACK_FAILURE;
-            }
+            assert(offset == stream->received); // ngtcp2 delivers contiguous stream data.
             if (size) {
                 auto buffer = stream->pool->allocate(size);
                 buffer.append(std::as_bytes(std::span{bytes, size}));
@@ -512,7 +504,7 @@ static auto callbacks() -> ngtcp2_callbacks {
             if (flags & NGTCP2_STREAM_CLOSE2_FLAG_RX_APP_ERROR_CODE_SET) {
                 stream->readError = make_error_code(QuicError::StreamReset);
                 stream->appError = rxError;
-                stream->discardReceived(self, std::max(stream->received, stream->consumed));
+                stream->discardReceived(self, stream->received);
             }
             if (flags & NGTCP2_STREAM_CLOSE2_FLAG_TX_APP_ERROR_CODE_SET) {
                 stream->writeError = make_error_code(QuicError::StreamReset);
@@ -789,12 +781,12 @@ static auto sendPackets(const std::shared_ptr<ContextState> &context,
 }
 
 static auto receiveWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
-    auto token = co_await ilias::this_coro::stopToken();
     size_t handled = 0;
     auto turn = timestamp();
-    while (!state->stopped && !token.stop_requested()) {
+    while (!state->stopped) {
+        co_await ilias::this_coro::stopPoint();
         ILIAS_CO_TRY(auto received, co_await state->socket.receive());
-        if (state->stopped || token.stop_requested()) {
+        if (state->stopped) {
             break;
         }
         auto now = timestamp();
@@ -821,8 +813,8 @@ static auto receiveWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
 }
 
 static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
-    auto token = co_await ilias::this_coro::stopToken();
-    while (!state->stopped && !token.stop_requested()) {
+    while (!state->stopped) {
+        co_await ilias::this_coro::stopPoint();
         state->wake.clear();
         auto now = timestamp();
         state->removeExpired(now);
@@ -845,7 +837,7 @@ static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
             }
         }
         state->notify();
-        if (state->stopped || token.stop_requested()) {
+        if (state->stopped) {
             break;
         }
         auto deadline = timestamp() + NGTCP2_SECONDS;
@@ -861,8 +853,8 @@ static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
 }
 
 static auto timerWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
-    auto token = co_await ilias::this_coro::stopToken();
-    while (!state->stopped && !token.stop_requested()) {
+    while (!state->stopped) {
+        co_await ilias::this_coro::stopPoint();
         state->timerChanged.clear();
         auto deadline = state->deadline;
         if (deadline == UINT64_MAX) {
@@ -873,7 +865,7 @@ static auto timerWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
         auto now = timestamp();
         auto delay = std::chrono::nanoseconds(deadline > now ? deadline - now : 0);
         auto [changed, expired] = co_await ilias::whenAny(state->timerChanged.wait(), ilias::sleep(delay));
-        if (expired && !state->stopped && !token.stop_requested()) {
+        if (expired && !state->stopped) {
             // Wait for the sender to publish a fresh deadline before arming again.
             state->armedDeadline = 0;
             state->wake.set();
@@ -891,8 +883,8 @@ static auto closeConnections(std::shared_ptr<ContextState> state) -> ilias::Task
             auto _ = co_await sendPackets(state, connection);
         }
     };
-    // Finish notification even when run() was canceled, without delaying exit indefinitely.
-    auto _ = co_await ilias::unstoppable(ilias::timeout(send(), std::chrono::milliseconds{250}));
+    // finally() shields cleanup from cancellation; the timeout still bounds sends.
+    auto _ = co_await ilias::timeout(send(), std::chrono::milliseconds{250});
 }
 
 static auto runContext(std::shared_ptr<ContextState> state) -> IoTask<void> {
@@ -970,7 +962,7 @@ auto QuicContext::bind(IPEndpoint local, Config config) -> IoTask<QuicContext> {
 #endif
     }
     ILIAS_CO_TRYV(socket.bind(local));
-    ILIAS_CO_TRY(state->socket, quic::UdpBatchSocket::from(std::move(socket), state->config.udpBatching));
+    ILIAS_CO_TRY(state->socket, quic::UdpBatchSocket::from(std::move(socket), *state->pool, state->config.udpBatching));
     ILIAS_CO_TRY(state->local, state->socket.localEndpoint());
     co_return QuicContext{std::move(state)};
 }
@@ -1107,9 +1099,8 @@ auto QuicContext::connect(IPEndpoint remote, std::string serverName) -> IoTask<Q
         }
     }};
     state->wake.set();
-    auto token = co_await ilias::this_coro::stopToken();
     while (!connection->handshake && !connection->error) {
-        ILIAS_CO_TRYV(co_await waitChanged(connection->changed, token));
+        co_await waitChanged(connection->changed);
     }
     if (connection->error) {
         co_return Err(connection->error);
@@ -1123,7 +1114,6 @@ auto QuicContext::accept() -> IoTask<QuicConnection> {
     if (!state || state->config.role != Role::Server) {
         co_return Err(std::make_error_code(std::errc::invalid_argument));
     }
-    auto token = co_await ilias::this_coro::stopToken();
     while (true) {
         if (state->stopped) {
             co_return Err(state->error);
@@ -1135,7 +1125,7 @@ auto QuicContext::accept() -> IoTask<QuicConnection> {
                 co_return QuicConnection{std::move(connection)};
             }
         }
-        ILIAS_CO_TRYV(co_await waitChanged(state->changed, token));
+        co_await waitChanged(state->changed);
     }
 }
 
@@ -1157,7 +1147,6 @@ auto QuicConnection::openStream() -> IoTask<QuicStream> {
     if (!state) {
         co_return Err(std::make_error_code(std::errc::bad_file_descriptor));
     }
-    auto token = co_await ilias::this_coro::stopToken();
     while (true) {
         if (state->error) {
             co_return Err(state->error);
@@ -1170,7 +1159,7 @@ auto QuicConnection::openStream() -> IoTask<QuicStream> {
         if (rv != NGTCP2_ERR_STREAM_ID_BLOCKED) {
             co_return Err(transportError(rv));
         }
-        ILIAS_CO_TRYV(co_await waitChanged(state->changed, token));
+        co_await waitChanged(state->changed);
     }
 }
 
@@ -1179,7 +1168,6 @@ auto QuicConnection::acceptStream() -> IoTask<QuicStream> {
     if (!state) {
         co_return Err(std::make_error_code(std::errc::bad_file_descriptor));
     }
-    auto token = co_await ilias::this_coro::stopToken();
     while (true) {
         if (state->error) {
             co_return Err(state->error);
@@ -1191,7 +1179,7 @@ auto QuicConnection::acceptStream() -> IoTask<QuicStream> {
                 co_return QuicStream{std::move(stream)};
             }
         }
-        ILIAS_CO_TRYV(co_await waitChanged(state->changed, token));
+        co_await waitChanged(state->changed);
     }
 }
 
@@ -1204,13 +1192,12 @@ auto QuicConnection::close(uint64_t appError) -> IoTask<void> {
         co_return Err(state->error);
     }
     state->close(appError);
-    auto token = co_await ilias::this_coro::stopToken();
     while (!state->closeSent) {
         auto owner = state->context.lock();
         if (!owner || owner->stopped) {
             co_return Err(owner ? owner->error : make_error_code(QuicError::ConnectionClosed));
         }
-        ILIAS_CO_TRYV(co_await waitChanged(state->changed, token));
+        co_await waitChanged(state->changed);
     }
     co_return {};
 }
@@ -1244,12 +1231,9 @@ auto QuicStream::read(ilias::MutableBuffer buffer) -> IoTask<size_t> {
     if (buffer.empty()) {
         co_return 0;
     }
-    auto token = co_await ilias::this_coro::stopToken();
     auto guard = co_await state->reader.lock();
     while (true) {
-        if (token.stop_requested()) {
-            co_return Err(std::make_error_code(std::errc::operation_canceled));
-        }
+        co_await ilias::this_coro::stopPoint();
         if (state->readError) {
             co_return Err(state->readError);
         }
@@ -1272,7 +1256,7 @@ auto QuicStream::read(ilias::MutableBuffer buffer) -> IoTask<size_t> {
         if (state->readFin) {
             co_return 0;
         }
-        ILIAS_CO_TRYV(co_await waitChanged(state->changed, token));
+        co_await waitChanged(state->changed);
     }
 }
 
@@ -1289,12 +1273,9 @@ auto QuicStream::write(ilias::Buffer buffer) -> IoTask<size_t> {
     if (!context) {
         co_return Err(make_error_code(QuicError::ConnectionClosed));
     }
-    auto token = co_await ilias::this_coro::stopToken();
     auto guard = co_await state->writer.lock();
     while (true) {
-        if (token.stop_requested()) {
-            co_return Err(std::make_error_code(std::errc::operation_canceled));
-        }
+        co_await ilias::this_coro::stopPoint();
         if (state->writeError) {
             co_return Err(state->writeError);
         }
@@ -1313,7 +1294,7 @@ auto QuicStream::write(ilias::Buffer buffer) -> IoTask<size_t> {
             connection->wake();
             co_return size;
         }
-        ILIAS_CO_TRYV(co_await waitChanged(state->changed, token));
+        co_await waitChanged(state->changed);
     }
 }
 
@@ -1322,19 +1303,16 @@ auto QuicStream::flush() -> IoTask<void> {
     if (!state) {
         co_return Err(std::make_error_code(std::errc::bad_file_descriptor));
     }
-    auto token = co_await ilias::this_coro::stopToken();
     auto guard = co_await state->writer.lock();
     while (true) {
-        if (token.stop_requested()) {
-            co_return Err(std::make_error_code(std::errc::operation_canceled));
-        }
+        co_await ilias::this_coro::stopPoint();
         if (state->writeError) {
             co_return Err(state->writeError);
         }
         if (state->sent == state->accepted) {
             co_return {};
         }
-        ILIAS_CO_TRYV(co_await waitChanged(state->changed, token));
+        co_await waitChanged(state->changed);
     }
 }
 
@@ -1343,7 +1321,6 @@ auto QuicStream::shutdown() -> IoTask<void> {
     if (!state) {
         co_return Err(std::make_error_code(std::errc::bad_file_descriptor));
     }
-    auto token = co_await ilias::this_coro::stopToken();
     auto guard = co_await state->writer.lock();
     if (state->writeError) {
         co_return Err(state->writeError);
@@ -1356,7 +1333,7 @@ auto QuicStream::shutdown() -> IoTask<void> {
         if (state->writeError) {
             co_return Err(state->writeError);
         }
-        ILIAS_CO_TRYV(co_await waitChanged(state->changed, token));
+        co_await waitChanged(state->changed);
     }
     co_return {};
 }

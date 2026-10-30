@@ -105,7 +105,7 @@ auto receiveInfo(ilias::MutableMsgHdr &msg, size_t size, size_t &segment, unsign
 
 } // namespace
 
-auto UdpBatchSocket::from(ilias::Socket socket, bool batching) -> IoResult<UdpBatchSocket> {
+auto UdpBatchSocket::from(ilias::Socket socket, SkBufferPool &pool, bool batching) -> IoResult<UdpBatchSocket> {
     UdpBatchSocket result;
     result.mBatching = batching;
     ILIAS_TRY(result.mHandle, ilias::IoHandle<ilias::Socket>::make(std::move(socket), ilias::IoDescriptor::Socket));
@@ -140,6 +140,9 @@ auto UdpBatchSocket::from(ilias::Socket socket, bool batching) -> IoResult<UdpBa
         batching ? receiveSlots :
 #endif
         1);
+    for (auto &slot : result.mReceive) {
+        slot.bytes = pool.allocate(receiveCapacity);
+    }
     return result;
 }
 
@@ -151,7 +154,6 @@ auto UdpBatchSocket::send(ilias::Buffer data, const ilias::IPEndpoint &remote,
     }
     auto count = (data.size() + segmentSize - 1) / segmentSize;
     auto ipv6 = remote.family() == AF_INET6 && !remote.address6().isV4Mapped();
-    auto token = co_await ilias::this_coro::stopToken();
     if (count > 1 && mStats.sendSegmentation) {
         ilias::IoVec vec{data};
         ilias::MsgHdr msg;
@@ -200,7 +202,7 @@ auto UdpBatchSocket::send(ilias::Buffer data, const ilias::IPEndpoint &remote,
             mStats.maxTxBatch = std::max(mStats.maxTxBatch, count);
             co_return Sent{count};
         }
-        if (token.stop_requested() || !unsupported(sent.error())) co_return Sent{0, sent.error()};
+        if (!unsupported(sent.error())) co_return Sent{0, sent.error()};
         // The failed operation has completed; only now is splitting safe.
         mStats.sendSegmentation = false;
         ++mStats.segmentationFallbacks;
@@ -225,7 +227,7 @@ auto UdpBatchSocket::send(ilias::Buffer data, const ilias::IPEndpoint &remote,
             }
         }
         while (completed < count) {
-            if (token.stop_requested()) co_return Sent{completed, std::make_error_code(std::errc::operation_canceled)};
+            co_await ilias::this_coro::stopPoint();
             ++mStats.txSubmissions;
             auto n = ::sendmmsg(mHandle.fd().get(), messages.data() + completed,
                 static_cast<unsigned int>(count - completed), MSG_DONTWAIT | MSG_NOSIGNAL);
@@ -275,8 +277,8 @@ auto UdpBatchSocket::send(ilias::Buffer data, const ilias::IPEndpoint &remote,
 }
 
 auto UdpBatchSocket::receive() -> IoTask<std::span<const Received>> {
-    auto token = co_await ilias::this_coro::stopToken();
-    while (!token.stop_requested()) {
+    while (true) {
+        co_await ilias::this_coro::stopPoint();
         size_t received = 0;
 #if defined(__linux__)
         if (mBatching) {
@@ -284,7 +286,9 @@ auto UdpBatchSocket::receive() -> IoTask<std::span<const Received>> {
             std::array<iovec, receiveSlots> vectors{};
             for (size_t i = 0; i < mReceive.size(); ++i) {
                 auto &slot = mReceive[i];
-                vectors[i] = {slot.data.data(), slot.data.size()};
+                slot.bytes.clear();
+                auto buffer = slot.bytes.prepareBack(receiveCapacity);
+                vectors[i] = {buffer.data(), buffer.size()};
                 auto &msg = messages[i].msg_hdr;
                 msg.msg_name = slot.remote.data();
                 msg.msg_namelen = slot.remote.bufsize();
@@ -306,14 +310,17 @@ auto UdpBatchSocket::receive() -> IoTask<std::span<const Received>> {
                 size_t segment;
                 unsigned int ecn;
                 if (!receiveInfo(msg, messages[i].msg_len, segment, ecn)) { ++mStats.droppedReceives; continue; }
-                mReceived[received++] = {ilias::makeBuffer(mReceive[i].data.data(), messages[i].msg_len), mReceive[i].remote, segment, ecn};
+                auto &slot = mReceive[i];
+                slot.bytes.commitBack(messages[i].msg_len);
+                mReceived[received++] = {ilias::makeBuffer(slot.bytes.data()), slot.remote, segment, ecn};
             }
         }
         else
 #endif
         {
             auto &slot = mReceive.front();
-            ilias::MutableIoVec vec{ilias::makeBuffer(slot.data)};
+            slot.bytes.clear();
+            ilias::MutableIoVec vec{ilias::makeBuffer(slot.bytes.prepareBack(receiveCapacity))};
             ilias::MutableMsgHdr msg;
             msg.setEndpoint(slot.remote);
             msg.setBuffers(std::span{&vec, 1});
@@ -333,7 +340,8 @@ auto UdpBatchSocket::receive() -> IoTask<std::span<const Received>> {
             size_t segment;
             unsigned int ecn;
             if (!receiveInfo(msg, *result, segment, ecn)) { ++mStats.droppedReceives; continue; }
-            mReceived[received++] = {ilias::makeBuffer(slot.data.data(), *result), slot.remote, segment, ecn};
+            slot.bytes.commitBack(*result);
+            mReceived[received++] = {ilias::makeBuffer(slot.bytes.data()), slot.remote, segment, ecn};
         }
         size_t datagrams = 0;
         for (size_t i = 0; i < received; ++i) {
@@ -347,7 +355,6 @@ auto UdpBatchSocket::receive() -> IoTask<std::span<const Received>> {
         mStats.maxRxBatch = std::max(mStats.maxRxBatch, datagrams);
         if (received) co_return std::span<const Received>{mReceived.data(), received};
     }
-    co_return Err(std::make_error_code(std::errc::operation_canceled));
 }
 
 } // namespace quic

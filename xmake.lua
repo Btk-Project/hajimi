@@ -94,6 +94,7 @@ if has_config("quic") then
     target_end()
 end
 
+-- Qt Gui Client
 if has_config("enable-gui") then
     target("hajimi-gui")
         add_rules("qt.quickapp")

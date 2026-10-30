@@ -12,7 +12,7 @@ using ilias::IPEndpoint;
 
 namespace {
 
-auto bindUdp(bool batching, int family = AF_INET, bool noChecksum = false) -> ilias::IoResult<quic::UdpBatchSocket> {
+auto bindUdp(SkBufferPool &pool, bool batching, int family = AF_INET, bool noChecksum = false) -> ilias::IoResult<quic::UdpBatchSocket> {
     ILIAS_TRY(auto socket, ilias::Socket::make(family, SOCK_DGRAM, IPPROTO_UDP));
     if (family == AF_INET6) ILIAS_TRYV(socket.setOption(ilias::sockopt::Ipv6Only{false}));
     ILIAS_TRYV(socket.bind(IPEndpoint::fromString(family == AF_INET6 ? "[::]:0" : "127.0.0.1:0").value()));
@@ -22,12 +22,13 @@ auto bindUdp(bool batching, int family = AF_INET, bool noChecksum = false) -> il
         ILIAS_TRYV(socket.setOption(SOL_SOCKET, SO_NO_CHECK, &enabled, sizeof(enabled)));
     }
 #endif
-    return quic::UdpBatchSocket::from(std::move(socket), batching);
+    return quic::UdpBatchSocket::from(std::move(socket), pool, batching);
 }
 
 auto transfer(bool sendBatching, bool receiveBatching, int family = AF_INET, bool noChecksum = false) -> IoTask<void> {
-    ILIAS_CO_TRY(auto sender, bindUdp(sendBatching, family, noChecksum));
-    ILIAS_CO_TRY(auto receiver, bindUdp(receiveBatching));
+    SkBufferPool pool{{{65536, 2}}};
+    ILIAS_CO_TRY(auto sender, bindUdp(pool, sendBatching, family, noChecksum));
+    ILIAS_CO_TRY(auto receiver, bindUdp(pool, receiveBatching));
     constexpr size_t segment = 1200;
     constexpr size_t count = 40;
     std::vector<std::byte> payload(segment * (count - 1) + 57);
@@ -125,7 +126,8 @@ ILIAS_TEST(UdpBatch, SegmentationFailureFallsBackToMmsg) {
 #endif
 
 ILIAS_TEST(UdpBatch, InvalidBatchAndReceiveCancellation) {
-    auto bound = bindUdp(true);
+    SkBufferPool pool{{{65536, 2}}};
+    auto bound = bindUdp(pool, true);
     EXPECT_TRUE(bound);
     if (!bound) co_return;
     auto &sender = *bound;
