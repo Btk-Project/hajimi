@@ -2,6 +2,7 @@
 
 #include "quic.hpp"
 #include "../skbuf.hpp"
+#include <ilias/net/cmsg.hpp>
 #include <array>
 #include <span>
 #include <vector>
@@ -12,6 +13,7 @@ namespace quic {
  * @brief A UDP socket with reusable pooled receive buffers and optional batching.
  * @note The pool passed to from() must outlive the socket and its pending I/O.
  *       One owner registers the socket with ilias; all I/O stays on that executor.
+ * @note At most one send() and one receive() may be active; they may run concurrently.
  */
 class UdpBatchSocket {
 public:
@@ -41,18 +43,19 @@ public:
     /// @brief Receive borrowed views valid until the next receive() or socket destruction.
     auto receive() -> IoTask<std::span<const Received>>;
 
-    auto localEndpoint() const { return mHandle.fd().localEndpoint<IPEndpoint>(); }
-    auto close() -> void { mHandle.close(); }
+    auto localEndpoint() const { return mSocket.localEndpoint(); }
+    auto close() -> void { mSocket.close(); }
     auto stats() const noexcept -> QuicContext::IoStats { return mStats; }
 
 private:
     struct ReceiveSlot {
         SkBuffer bytes;
         IPEndpoint remote;
-        alignas(size_t) std::array<std::byte, 128> control;
+        ilias::CmsgSpace control;
     };
 
-    ilias::IoHandle<ilias::Socket> mHandle;
+    ilias::UdpSocket mSocket;
+    ilias::CmsgSpace mSendControl;
     std::vector<ReceiveSlot> mReceive;
     std::array<Received, receiveSlots> mReceived;
     QuicContext::IoStats mStats;

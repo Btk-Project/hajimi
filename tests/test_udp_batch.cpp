@@ -84,6 +84,33 @@ auto transfer(bool sendBatching, bool receiveBatching, int family = AF_INET, boo
     co_return {};
 }
 
+auto reuseControl(bool batching, int sendFamily, int receiveFamily) -> IoTask<void> {
+    SkBufferPool pool{{{65536, 2}}};
+    ILIAS_CO_TRY(auto sender, bindUdp(pool, batching, sendFamily));
+    ILIAS_CO_TRY(auto receiver, bindUdp(pool, batching, receiveFamily));
+    auto port = receiver.localEndpoint().value().port();
+    auto remote = IPEndpoint::fromString(receiveFamily == AF_INET6 ? "[::1]:0" : "127.0.0.1:0").value();
+    remote = {remote.address(), port};
+    if (sendFamily == AF_INET6 && receiveFamily == AF_INET) {
+        remote = {ilias::IPAddress6::fromV4Mapped(remote.address4()), port};
+    }
+    // Cancellation must release the receive operation before its storage is reused.
+    EXPECT_FALSE(co_await ilias::timeout(receiver.receive(), 5ms));
+    std::array<std::byte, 8> payload{};
+    for (auto ecn : {2u, 0u, 1u}) {
+        auto sent = co_await sender.send(payload, remote, payload.size(), ecn);
+        if (sent.error) co_return Err(sent.error);
+        EXPECT_EQ(sent.datagrams, 1);
+        ILIAS_CO_TRY(auto received, co_await receiver.receive());
+        EXPECT_EQ(received.size(), 1);
+        for (auto &message : received) {
+            EXPECT_EQ(message.ecn, ecn);
+            EXPECT_TRUE(std::ranges::equal(message.bytes, payload));
+        }
+    }
+    co_return {};
+}
+
 } // namespace
 
 ILIAS_TEST(UdpBatch, DatagramBoundariesAndShortTail) {
@@ -113,6 +140,17 @@ ILIAS_TEST(UdpBatch, SinglePacketFallback) {
 ILIAS_TEST(UdpBatch, DualStackSegmentedIPv4) {
     auto result = co_await transfer(true, true, AF_INET6);
     EXPECT_TRUE(result) << result.error().message();
+    co_return;
+}
+
+ILIAS_TEST(UdpBatch, EcnAndControlReuseAfterCancellation) {
+    for (bool batching : {false, true}) {
+        for (auto [sender, receiver] : {std::pair{AF_INET, AF_INET}, {AF_INET6, AF_INET6}, {AF_INET6, AF_INET}}) {
+            auto result = co_await ilias::timeout(reuseControl(batching, sender, receiver), 3s);
+            EXPECT_TRUE(result);
+            if (result) EXPECT_TRUE(*result) << result->error().message();
+        }
+    }
     co_return;
 }
 
