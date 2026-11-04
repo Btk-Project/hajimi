@@ -20,6 +20,9 @@ namespace quic {
 struct ContextState;
 struct ConnectionState;
 struct StreamState;
+#ifdef HAJIMI_QUIC_TESTING
+struct ContextTestAccess;
+#endif
 } // namespace quic
 
 class QuicConnection;
@@ -168,6 +171,8 @@ public:
      * @brief Drive packet I/O, timers and connection handshakes until stopped.
      * @pre This context has not been stopped and no other run() is active.
      * @return Success on stop(), or an I/O error from a worker.
+     * @note Recoverable UDP errors retry with backoff on the same socket. An encoded
+     *       send batch is retained until sent or its connection retry timeout expires.
      * @note Stop and cancellation attempt CONNECTION_CLOSE for all active peers
      *       before closing UDP. Cleanup has a total 250 ms budget and ignores
      *       cancellation; it does not wait for peer acknowledgements.
@@ -206,6 +211,7 @@ public:
      * @brief Wait for an incoming connection whose TLS handshake has completed.
      * @pre The context has Role::Server and run() is active concurrently.
      * @note Cancellation removes only this waiter; stop() wakes it with an error.
+     *       An error from accept() is terminal for this context; do not retry it.
      */
     auto accept() -> IoTask<QuicConnection>;
 
@@ -221,6 +227,9 @@ public:
 private:
     explicit QuicContext(std::shared_ptr<quic::ContextState> state);
     std::shared_ptr<quic::ContextState> mState;
+#ifdef HAJIMI_QUIC_TESTING
+    friend struct quic::ContextTestAccess;
+#endif
 };
 
 /**

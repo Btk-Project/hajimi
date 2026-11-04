@@ -24,6 +24,7 @@ using ilias::MutableBuffer;
 using ilias::TcpListener;
 using ilias::IPEndpoint;
 using ilias::TaskScope;
+using ilias::Err;
 using ilias::Task;
 using ilias::Event;
 
@@ -121,6 +122,7 @@ auto ProxyServer::run() -> IoTask<void> {
     WebUi ui{*this, mConfig.webui};
 
     // Handle incoming connection
+    ScopeExit resetScope{[&]() { mScope = nullptr; }};
     co_return co_await TaskScope::enter([&](auto &scope) -> IoTask<void> {
         mScope = &scope;
         if (mDuckDns) {
@@ -134,11 +136,14 @@ auto ProxyServer::run() -> IoTask<void> {
         tasks.emplace_back(runQuic());
 #endif // HAJIMI_QUIC
 
-        co_return co_await ilias::whenAny(std::move(tasks));
+        auto result = co_await ilias::whenAny(std::move(tasks));
+        scope.stop(); // enter() joins children; it does not stop them on a normal error return.
+        co_return result;
     });
 }
 
 auto ProxyServer::runTcp() -> IoTask<void> {
+    using namespace std::chrono_literals;
     std::println("[ProxyServer] Tcp listen on {}", mConfig.listen);
 
     ILIAS_CO_TRY(auto listener, co_await ilias::TcpBuilder{mConfig.listen.family()}
@@ -149,7 +154,8 @@ auto ProxyServer::runTcp() -> IoTask<void> {
     while (true) {
         auto incoming = co_await listener.accept();
         if (!incoming) {
-            std::println("[ProxyServer] error at accept {}", incoming.error().message());
+            std::println("[ProxyServer] error at accept tcp: {}", incoming.error().message());
+            co_await ilias::sleep(1s);
             continue;
         }
         auto &[sock, addr] = *incoming;
@@ -164,9 +170,7 @@ auto ProxyServer::runQuic() -> IoTask<void> {
     using namespace std::chrono_literals;
     if (mConfig.certFile.empty() || mConfig.keyFile.empty()) {
         std::println("[ProxyServer] Cert or key file is empty, disable quic");
-        while (true) {
-            co_await ilias::sleep(1h); // Wait for cancel
-        }
+        co_await ilias::this_coro::suspendForever(); // Wait for cancel
     }
 
     std::println("[ProxyServer] Quic listen on {}", mConfig.listen);
@@ -185,20 +189,28 @@ auto ProxyServer::runQuic() -> IoTask<void> {
         co_return co_await handleSession(std::move(stream), conn.remoteEndpoint(), "QUIC");
     };
 
-    // Accept each connections
-    auto loop = [&]() -> Task<void> {
+    TaskScope connections;
+    auto loop = [&]() -> IoTask<void> {
         while (true) {
             auto incoming = co_await listener.accept();
             if (!incoming) {
-                std::println("[ProxyServer] error at accept {}", incoming.error().message());
-                continue;
+                auto error = incoming.error();
+                std::println(stderr, "[ProxyServer/QUIC] accept failed: {} ({}:{})",
+                    error.message(), error.category().name(), error.value());
+                co_return Err(error);
             }
-            std::println("ProxyServer] New quic connection from {}", incoming->remoteEndpoint());
-            mScope->spawn(worker(std::move(*incoming)));
+            std::println("[ProxyServer] New quic connection from {}", incoming->remoteEndpoint());
+            connections.spawn(worker(std::move(*incoming)));
         }
     };
-    auto _ = co_await ilias::whenAll(loop(), listener.run());
-    co_return {};
+    auto serve = [&]() -> IoTask<void> {
+        // whenAny cancels and joins the other task, including run()'s cleanup.
+        auto [accepted, driven] = co_await ilias::whenAny(loop(), listener.run());
+        if (accepted) co_return std::move(*accepted);
+        co_return std::move(*driven);
+    };
+    // Join sessions before destroying their coroutine closure or listener.
+    co_return co_await ilias::finally(serve(), connections.shutdown());
 }
 #endif // HAJIMI_QUIC
 

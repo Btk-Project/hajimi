@@ -222,3 +222,6 @@ __marimo__/
 .vscode
 .clice
 build-*/
+
+# Agents
+docs/*.md

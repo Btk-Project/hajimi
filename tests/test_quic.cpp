@@ -7,6 +7,9 @@
 #include <array>
 #include <vector>
 #include "../src/quic/quic.hpp"
+#include "../src/quic/test_hooks.hpp"
+#include "../src/utils/scope_exit.hpp"
+#include "../src/server.hpp"
 
 using namespace std::literals;
 using ilias::Err;
@@ -885,5 +888,297 @@ ILIAS_TEST(Quic, HostnameConnectCancellation) {
         });
     EXPECT_TRUE(result) << result.error().message();
 }
+
+#ifdef HAJIMI_QUIC_TESTING
+ILIAS_TEST(Quic, ProxyServerExitsOnStoppedContext) {
+    auto error = std::error_code(ilias::SystemError::BadFileDescriptor);
+    quic::ContextTestAccess::setNextBindFault([=](auto remote, size_t) -> std::error_code {
+        return remote ? std::error_code{} : error;
+    });
+    ScopeExit resetFault{[]() { quic::ContextTestAccess::setNextBindFault({}); }};
+    ProxyServer server{{
+        .listen = "127.0.0.1:0",
+        .webui = "127.0.0.1:0",
+        .certFile = HAJIMI_QUIC_TEST_DIR "/localhost.pem",
+        .keyFile = HAJIMI_QUIC_TEST_DIR "/localhost-key.pem",
+    }};
+    auto result = co_await ilias::timeout(server.run(), 1s);
+    EXPECT_TRUE(result) << "The accept loop must terminate when its context stops";
+    if (result) {
+        EXPECT_FALSE(*result);
+        if (!*result) EXPECT_EQ(result->error(), error);
+    }
+}
+
+ILIAS_TEST(Quic, TransientSendRetainsPacketsAndFlush) {
+    for (bool batching : {false, true}) {
+        auto config = clientConfig();
+        config.udpBatching = batching;
+        auto result = co_await withContexts(serverConfig(), config,
+            [](QuicContext &server, QuicContext &client) -> IoTask<void> {
+                auto [connected, accepted] = co_await ilias::whenAll(
+                    client.connect(server.localEndpoint().value(), "localhost"), server.accept());
+                ILIAS_CO_TRY(auto local, std::move(connected));
+                ILIAS_CO_TRY(auto peer, std::move(accepted));
+                bool blocked = true;
+                size_t attempts = 0;
+                quic::ContextTestAccess::setFaultInjector(client, [&](auto remote, size_t) -> std::error_code {
+                    if (remote && blocked) { ++attempts; return ilias::SystemError::NetworkUnreachable; }
+                    return {};
+                });
+                ScopeExit resetFault{[&]() { quic::ContextTestAccess::setFaultInjector(client, {}); }};
+                ILIAS_CO_TRY(auto stream, co_await local.openStream());
+                std::string payload(48 * 1024, 'r');
+                ILIAS_CO_TRYV(co_await stream.writeAll(ilias::makeBuffer(payload)));
+                auto before = client.ioStats().txDatagrams;
+                EXPECT_FALSE(co_await ilias::timeout(stream.flush(), 100ms));
+                EXPECT_EQ(client.ioStats().txDatagrams, before);
+                EXPECT_GE(attempts, 2);
+                EXPECT_LT(attempts, 20); // Persistent errors must yield to timers and other work.
+                blocked = false;
+                auto send = [&]() -> IoTask<void> {
+                    ILIAS_CO_TRYV(co_await stream.flush());
+                    co_return co_await stream.shutdown();
+                };
+                auto read = [&]() -> IoTask<void> {
+                    ILIAS_CO_TRY(auto incoming, co_await peer.acceptStream());
+                    std::string bytes(payload.size(), '\0');
+                    ILIAS_CO_TRYV(co_await incoming.readAll(ilias::makeBuffer(bytes)));
+                    EXPECT_EQ(bytes, payload);
+                    char byte;
+                    ILIAS_CO_TRY(auto eof, co_await incoming.read(ilias::makeBuffer(&byte, 1)));
+                    EXPECT_EQ(eof, 0);
+                    co_return {};
+                };
+                auto [sent, received] = co_await ilias::whenAll(send(), read());
+                quic::ContextTestAccess::setFaultInjector(client, {});
+                ILIAS_CO_TRYV(std::move(sent));
+                co_return std::move(received);
+            });
+        EXPECT_TRUE(result) << result.error().message();
+    }
+}
+
+ILIAS_TEST(Quic, UnreachablePeerDoesNotStopSharedContext) {
+    for (auto error : {ilias::SystemError::NetworkUnreachable, ilias::SystemError::HostUnreachable,
+        ilias::SystemError::MessageTooLarge}) {
+        auto config = clientConfig();
+        config.handshakeTimeout = 180ms;
+        auto result = co_await withContexts(serverConfig(), config,
+            [error](QuicContext &server, QuicContext &client) -> IoTask<void> {
+                ILIAS_CO_TRY(auto blackhole, co_await ilias::UdpSocket::bind("127.0.0.1:0"));
+                auto bad = blackhole.localEndpoint().value();
+                size_t attempts = 0;
+                quic::ContextTestAccess::setFaultInjector(client, [&, error](auto remote, size_t) -> std::error_code {
+                    if (remote && *remote == bad) { ++attempts; return error; }
+                    return {};
+                });
+                ScopeExit resetFault{[&]() { quic::ContextTestAccess::setFaultInjector(client, {}); }};
+                auto broken = [&]() -> IoTask<void> {
+                    auto connection = co_await client.connect(bad, "localhost");
+                    EXPECT_FALSE(connection);
+                    if (!connection) {
+                        EXPECT_EQ(connection.error(), std::errc::timed_out);
+                    }
+                    co_return {};
+                };
+                auto healthy = [&]() -> IoTask<void> {
+                    for (int i = 0; i < 2; ++i) {
+                        auto [connected, accepted] = co_await ilias::whenAll(
+                            client.connect(server.localEndpoint().value(), "localhost"), server.accept());
+                        ILIAS_CO_TRY(auto local, std::move(connected));
+                        ILIAS_CO_TRY(auto peer, std::move(accepted));
+                        auto serve = [&]() -> IoTask<void> {
+                            ILIAS_CO_TRY(auto stream, co_await peer.acceptStream());
+                            co_return co_await echo(std::move(stream));
+                        };
+                        auto [sent, read] = co_await ilias::whenAll(exchange(local, 65536, 'h'), serve());
+                        ILIAS_CO_TRYV(std::move(sent));
+                        ILIAS_CO_TRYV(std::move(read));
+                        co_await ilias::sleep(200ms);
+                    }
+                    co_return {};
+                };
+                auto [failed, transferred] = co_await ilias::whenAll(broken(), healthy());
+                quic::ContextTestAccess::setFaultInjector(client, {});
+                EXPECT_GT(attempts, 0);
+                EXPECT_LT(attempts, 20);
+                ILIAS_CO_TRYV(std::move(failed));
+                co_return std::move(transferred);
+            });
+        EXPECT_TRUE(result) << result.error().message();
+    }
+}
+
+ILIAS_TEST(Quic, TransientReceiveErrorsRecoverOnSameSocket) {
+    for (bool batching : {false, true}) {
+        auto config = serverConfig();
+        config.udpBatching = batching;
+        IPEndpoint original;
+        size_t failures = 0;
+        auto result = co_await withContexts(config, clientConfig(),
+            [&](QuicContext &server, QuicContext &client) -> IoTask<void> {
+                original = server.localEndpoint().value();
+                auto recoverAt = std::chrono::steady_clock::now() + 120ms;
+                quic::ContextTestAccess::setFaultInjector(server, [&](auto remote, size_t) -> std::error_code {
+                    if (!remote && std::chrono::steady_clock::now() < recoverAt) {
+                        ++failures;
+                        return failures % 2 ? ilias::SystemError::NetworkUnreachable : ilias::SystemError::ConnectionRefused;
+                    }
+                    return {};
+                });
+                ScopeExit resetFault{[&]() { quic::ContextTestAccess::setFaultInjector(server, {}); }};
+                for (int i = 0; i < 2; ++i) {
+                    auto [connected, accepted] = co_await ilias::whenAll(client.connect(original, "localhost"), server.accept());
+                    ILIAS_CO_TRY(auto local, std::move(connected));
+                    ILIAS_CO_TRY(auto peer, std::move(accepted));
+                    auto serve = [&]() -> IoTask<void> {
+                        ILIAS_CO_TRY(auto stream, co_await peer.acceptStream());
+                        co_return co_await echo(std::move(stream));
+                    };
+                    auto [sent, read] = co_await ilias::whenAll(exchange(local, 16384, 'u'), serve());
+                    ILIAS_CO_TRYV(std::move(sent));
+                    ILIAS_CO_TRYV(std::move(read));
+                }
+                quic::ContextTestAccess::setFaultInjector(server, {});
+                EXPECT_EQ(server.localEndpoint().value(), original);
+                EXPECT_GE(failures, 2);
+                EXPECT_LT(failures, 20);
+                co_return {};
+            });
+        EXPECT_TRUE(result) << result.error().message();
+    }
+}
+
+ILIAS_TEST(Quic, FatalUdpErrorWakesAcceptAndAllowsRebind) {
+    for (bool sending : {false, true}) {
+        auto bound = co_await QuicContext::bind("127.0.0.1:0", serverConfig());
+        EXPECT_TRUE(bound);
+        if (!bound) co_return;
+        auto &context = *bound;
+        auto endpoint = context.localEndpoint().value();
+        auto error = std::error_code(ilias::SystemError::BadFileDescriptor);
+        quic::ContextTestAccess::setFaultInjector(context, [=](auto remote, size_t) -> std::error_code {
+            return bool(remote) == sending ? error : std::error_code{};
+        });
+        size_t accepts = 0;
+        auto accept = [&]() -> IoTask<void> {
+            ++accepts;
+            auto incoming = co_await context.accept();
+            if (!incoming) co_return Err(incoming.error());
+            co_return {};
+        };
+        auto run = [&]() -> IoTask<void> {
+            auto [accepted, driven] = co_await ilias::whenAll(accept(), context.run());
+            EXPECT_FALSE(accepted);
+            EXPECT_FALSE(driven);
+            if (!accepted) EXPECT_EQ(accepted.error(), error);
+            if (!driven) EXPECT_EQ(driven.error(), error);
+            co_return {};
+        };
+        auto exercise = [&]() -> IoTask<void> {
+            if (!sending) co_return co_await run();
+            ILIAS_CO_TRY(auto client, co_await QuicContext::bind("127.0.0.1:0", clientConfig()));
+            co_return co_await ilias::TaskScope::enter([&](ilias::TaskScope &scope) -> IoTask<void> {
+                scope.spawn(client.run());
+                scope.spawn(client.connect(endpoint, "localhost"));
+                auto result = co_await run();
+                scope.stop();
+                co_return result;
+            });
+        };
+        auto result = co_await ilias::timeout(exercise(), 2s);
+        EXPECT_TRUE(result);
+        if (result) EXPECT_TRUE(*result);
+        EXPECT_EQ(accepts, 1);
+        auto stopped = co_await context.accept();
+        EXPECT_FALSE(stopped);
+        if (!stopped) EXPECT_EQ(stopped.error(), error);
+        auto rebound = co_await QuicContext::bind(endpoint, serverConfig());
+        EXPECT_TRUE(rebound);
+    }
+}
+
+ILIAS_TEST(Quic, CancellationDuringUdpBackoffJoinsWorkers) {
+    for (bool cancel : {false, true}) {
+        auto bound = co_await QuicContext::bind("127.0.0.1:0", serverConfig());
+        EXPECT_TRUE(bound);
+        if (!bound) co_return;
+        size_t attempts = 0;
+        quic::ContextTestAccess::setFaultInjector(*bound, [&](auto remote, size_t) -> std::error_code {
+            if (!remote) { ++attempts; return ilias::SystemError::NetworkDown; }
+            return {};
+        });
+        auto exercise = [&]() -> Task<void> {
+            ilias::TaskScope scope;
+            auto driver = scope.spawn(bound->run());
+            co_await ilias::sleep(80ms);
+            if (cancel) driver.stop();
+            else bound->stop();
+            co_await scope.waitAll();
+        };
+        EXPECT_TRUE(co_await ilias::timeout(exercise(), 500ms));
+        EXPECT_GE(attempts, 2);
+        EXPECT_LT(attempts, 20);
+        auto accepted = co_await bound->accept();
+        EXPECT_FALSE(accepted);
+        if (!accepted) EXPECT_EQ(accepted.error(), std::errc::operation_canceled);
+    }
+}
+
+ILIAS_TEST(Quic, FailedCloseFinishesWithoutStoppingContext) {
+    for (auto error : {ilias::SystemError::AccessDenied, ilias::SystemError::NetworkUnreachable}) {
+        auto config = clientConfig();
+        config.idleTimeout = 150ms;
+        auto result = co_await withContexts(serverConfig(), config,
+            [error](QuicContext &server, QuicContext &client) -> IoTask<void> {
+                auto [connected, accepted] = co_await ilias::whenAll(
+                    client.connect(server.localEndpoint().value(), "localhost"), server.accept());
+                ILIAS_CO_TRY(auto local, std::move(connected));
+                ILIAS_CO_TRY(auto peer, std::move(accepted));
+                quic::ContextTestAccess::setFaultInjector(client, [=](auto remote, size_t) -> std::error_code {
+                    return remote ? std::error_code(error) : std::error_code{};
+                });
+                ScopeExit resetFault{[&]() { quic::ContextTestAccess::setFaultInjector(client, {}); }};
+                auto closed = co_await ilias::timeout(local.close(), 600ms);
+                EXPECT_TRUE(closed);
+                if (closed) EXPECT_FALSE(*closed);
+                quic::ContextTestAccess::setFaultInjector(client, {});
+                auto [reconnected, reaccepted] = co_await ilias::whenAll(
+                    client.connect(server.localEndpoint().value(), "localhost"), server.accept());
+                ILIAS_CO_TRY(auto next, std::move(reconnected));
+                ILIAS_CO_TRY(auto incoming, std::move(reaccepted));
+                co_return {};
+            });
+        EXPECT_TRUE(result) << result.error().message();
+    }
+}
+
+ILIAS_TEST(Quic, ShutdownDuringPendingSendReleasesPackets) {
+    for (bool cancel : {false, true}) {
+        auto exercise = withContexts(serverConfig(), clientConfig(),
+            [cancel](QuicContext &server, QuicContext &client) -> IoTask<void> {
+                auto [connected, accepted] = co_await ilias::whenAll(
+                    client.connect(server.localEndpoint().value(), "localhost"), server.accept());
+                ILIAS_CO_TRY(auto local, std::move(connected));
+                ILIAS_CO_TRY(auto peer, std::move(accepted));
+                quic::ContextTestAccess::setFaultInjector(server, [](auto remote, size_t) -> std::error_code {
+                    return remote ? std::error_code(ilias::SystemError::NetworkUnreachable) : std::error_code{};
+                });
+                ScopeExit resetFault{[&]() { quic::ContextTestAccess::setFaultInjector(server, {}); }};
+                ILIAS_CO_TRY(auto stream, co_await peer.openStream());
+                ILIAS_CO_TRYV(co_await stream.writeString("pending"));
+                EXPECT_FALSE(co_await ilias::timeout(stream.flush(), 50ms));
+                if (cancel) co_await ilias::this_coro::suspendForever();
+                server.stop();
+                co_return {};
+            });
+        // Timeout cancels the enclosing scope while an encoded stream batch is pending.
+        auto result = co_await ilias::timeout(std::move(exercise), cancel ? 150ms : 1s);
+        EXPECT_EQ(bool(result), !cancel);
+        if (result) EXPECT_TRUE(*result) << result->error().message();
+    }
+}
+#endif
 
 #endif // HAJIMI_QUIC

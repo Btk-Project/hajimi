@@ -137,6 +137,11 @@ auto UdpBatchSocket::send(ilias::Buffer data, const IPEndpoint &remote,
     }
     auto count = (data.size() + segmentSize - 1) / segmentSize;
     auto ipv6 = remote.family() == AF_INET6 && !remote.address6().isV4Mapped();
+#ifdef HAJIMI_QUIC_TESTING
+    if (mFault) {
+        if (auto error = mFault(&remote, 0)) co_return Sent{0, error};
+    }
+#endif
 #if defined(_WIN32) || defined(UDP_SEGMENT)
     if (count > 1 && mStats.sendSegmentation) {
         CmsgWriter writer{mSendControl};
@@ -180,9 +185,19 @@ auto UdpBatchSocket::send(ilias::Buffer data, const IPEndpoint &remote,
         }
         while (completed < count) {
             co_await ilias::this_coro::stopPoint();
+#ifdef HAJIMI_QUIC_TESTING
+            if (mFault) {
+                if (auto error = mFault(&remote, completed)) co_return Sent{completed, error};
+            }
+#endif
             ++mStats.txSubmissions;
+            auto submissionCount = static_cast<unsigned int>(count - completed);
+#ifdef HAJIMI_QUIC_TESTING
+            // Expose partial completion deterministically when injecting syscall errors.
+            if (mFault) submissionCount = 1;
+#endif
             auto n = ::sendmmsg(mSocket.fd().get(), messages.data() + completed,
-                static_cast<unsigned int>(count - completed), MSG_DONTWAIT | MSG_NOSIGNAL);
+                submissionCount, MSG_DONTWAIT | MSG_NOSIGNAL);
             if (n > 0) {
                 for (int i = 0; i < n; ++i) mStats.txBytes += messages[completed + i].msg_len;
                 completed += n;
@@ -190,7 +205,6 @@ auto UdpBatchSocket::send(ilias::Buffer data, const IPEndpoint &remote,
                 mStats.maxTxBatch = std::max(mStats.maxTxBatch, static_cast<size_t>(n));
                 continue;
             }
-            if (n < 0 && errno == EINTR) continue;
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 auto ready = co_await mSocket.poll(ilias::PollEvent::Out);
                 if (!ready) co_return Sent{completed, ready.error()};
@@ -203,6 +217,12 @@ auto UdpBatchSocket::send(ilias::Buffer data, const IPEndpoint &remote,
     }
 #endif
     while (completed < count) {
+        co_await ilias::this_coro::stopPoint();
+#ifdef HAJIMI_QUIC_TESTING
+        if (mFault) {
+            if (auto error = mFault(&remote, completed)) co_return Sent{completed, error};
+        }
+#endif
         auto bytes = data.subspan(completed * segmentSize, std::min(segmentSize, data.size() - completed * segmentSize));
         IoVec vec{bytes};
         MsgHdr msg;
@@ -222,6 +242,11 @@ auto UdpBatchSocket::send(ilias::Buffer data, const IPEndpoint &remote,
 auto UdpBatchSocket::receive() -> IoTask<std::span<const Received>> {
     while (true) {
         co_await ilias::this_coro::stopPoint();
+#ifdef HAJIMI_QUIC_TESTING
+        if (mFault) {
+            if (auto error = mFault(nullptr, 0)) co_return Err(error);
+        }
+#endif
         size_t received = 0;
 #if defined(__linux__)
         if (mBatching) {
@@ -237,7 +262,6 @@ auto UdpBatchSocket::receive() -> IoTask<std::span<const Received>> {
             }
             ++mStats.rxSubmissions;
             auto n = ::recvmmsg(mSocket.fd().get(), messages.data(), static_cast<unsigned int>(mReceive.size()), MSG_DONTWAIT, nullptr);
-            if (n < 0 && errno == EINTR) continue;
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 ILIAS_CO_TRYV(co_await mSocket.poll(ilias::PollEvent::In));
                 continue;

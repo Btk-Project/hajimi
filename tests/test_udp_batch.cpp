@@ -178,4 +178,57 @@ ILIAS_TEST(UdpBatch, InvalidBatchAndReceiveCancellation) {
     co_return;
 }
 
+#ifdef HAJIMI_QUIC_TESTING
+ILIAS_TEST(UdpBatch, SendErrorPreservesSuccessfulPrefix) {
+    for (bool batching : {false, true}) {
+#if !defined(__linux__)
+        if (batching) continue; // Linux SO_NO_CHECK forces GSO to fall back to sendmmsg.
+#endif
+        SkBufferPool pool{{{65536, 2}}};
+        auto boundSender = bindUdp(pool, batching, AF_INET, batching);
+        auto boundReceiver = bindUdp(pool, batching);
+        EXPECT_TRUE(boundSender);
+        EXPECT_TRUE(boundReceiver);
+        if (!boundSender || !boundReceiver) co_return;
+        auto &sender = *boundSender;
+        auto &receiver = *boundReceiver;
+        constexpr size_t segment = 1200;
+        std::vector<std::byte> bytes(segment * 2 + 57);
+        for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = std::byte(i / segment + 1);
+        sender.setFaultInjector([](auto remote, size_t completed) -> std::error_code {
+            if (remote && completed == 1) return ilias::SystemError::NetworkUnreachable;
+            return {};
+        });
+        auto remote = receiver.localEndpoint().value();
+        auto sent = co_await sender.send(bytes, remote, segment);
+        EXPECT_EQ(sent.datagrams, 1);
+        EXPECT_EQ(sent.error, std::error_code(ilias::SystemError::NetworkUnreachable));
+        EXPECT_EQ(sender.stats().txDatagrams, 1);
+        EXPECT_EQ(sender.stats().txBytes, segment);
+        sender.setFaultInjector({});
+        auto remaining = co_await sender.send(std::span{bytes}.subspan(segment), remote, segment);
+        EXPECT_FALSE(remaining.error);
+        EXPECT_EQ(remaining.datagrams, 2);
+        size_t offset = 0;
+        auto read = [&]() -> IoTask<void> {
+            while (offset < bytes.size()) {
+                ILIAS_CO_TRY(auto received, co_await receiver.receive());
+                for (auto &message : received) {
+                    if (offset + message.bytes.size() > bytes.size()) co_return Err(std::make_error_code(std::errc::bad_message));
+                    EXPECT_TRUE(std::ranges::equal(message.bytes, std::span{bytes}.subspan(offset, message.bytes.size())));
+                    offset += message.bytes.size();
+                }
+            }
+            co_return {};
+        };
+        auto result = co_await ilias::timeout(read(), 1s);
+        EXPECT_TRUE(result);
+        if (result) EXPECT_TRUE(*result);
+        EXPECT_EQ(sender.stats().txDatagrams, 3);
+        EXPECT_EQ(sender.stats().txBytes, bytes.size());
+        EXPECT_FALSE(co_await ilias::timeout(receiver.receive(), 5ms));
+    }
+}
+#endif
+
 #endif

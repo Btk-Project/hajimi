@@ -6,6 +6,9 @@
 #include <array>
 #include <span>
 #include <vector>
+#ifdef HAJIMI_QUIC_TESTING
+#include <functional>
+#endif
 
 namespace quic {
 
@@ -46,6 +49,11 @@ public:
     auto localEndpoint() const { return mSocket.localEndpoint(); }
     auto close() -> void { mSocket.close(); }
     auto stats() const noexcept -> QuicContext::IoStats { return mStats; }
+#ifdef HAJIMI_QUIC_TESTING
+    // A null endpoint denotes receive; completed is the successful send prefix.
+    using FaultInjector = std::function<std::error_code(const IPEndpoint *, size_t completed)>;
+    auto setFaultInjector(FaultInjector fault) -> void { mFault = std::move(fault); }
+#endif
 
 private:
     struct ReceiveSlot {
@@ -60,6 +68,9 @@ private:
     std::array<Received, receiveSlots> mReceived;
     QuicContext::IoStats mStats;
     bool mBatching = false;
+#ifdef HAJIMI_QUIC_TESTING
+    FaultInjector mFault;
+#endif
 };
 
 } // namespace quic

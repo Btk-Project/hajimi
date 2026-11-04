@@ -78,6 +78,7 @@ target("hajimi")
         add_packages("gtest")
         add_files("./tests/*.cpp")
         if has_config("quic") then
+            add_defines("HAJIMI_QUIC_TESTING")
             add_defines('HAJIMI_QUIC_TEST_DIR="' .. path.absolute("tests/certs"):gsub("\\", "/") .. '"')
         end
         add_tests("unit", {runargs = {"--test"}, timeout = 60000})

@@ -3,6 +3,7 @@
 #include "crypto.hpp"
 #include "quic.hpp"
 #include "udp_batch.hpp"
+#include "test_hooks.hpp"
 
 #include <ilias/sync.hpp>
 #include <ilias/task.hpp>
@@ -91,6 +92,44 @@ auto waitChanged(ilias::Event &event) {
     return event.wait();
 }
 
+// UDP errors can describe an earlier packet on this shared, unconnected socket.
+auto retryableUdpError(std::error_code error) -> bool {
+    using E = ilias::SystemError;
+    return error == E::NetworkUnreachable || error == E::HostUnreachable ||
+        error == E::NetworkDown || error == E::HostDown || error == E::NetworkReset ||
+        error == E::ConnectionRefused || error == E::ConnectionReset ||
+        error == E::ConnectionAborted || error == E::AddressNotAvailable ||
+        error == E::NoBufferSpaceAvailable || error == E::TimedOut ||
+        error == E::Interrupted || error == E::WouldBlock || error == E::AccessDenied ||
+        error == E::MessageTooLarge || error == std::errc::operation_not_permitted ||
+        error == std::errc::not_enough_memory;
+}
+
+struct UdpBackoff {
+    unsigned int failures = 0;
+    ngtcp2_tstamp nextLog = 0;
+
+    auto delay() -> ngtcp2_duration {
+        auto milliseconds = std::min(10u << failures, 1000u);
+        failures = std::min(failures + 1, 7u);
+        return milliseconds * NGTCP2_MILLISECONDS;
+    }
+
+    auto report(const char *operation, std::error_code error, const IPEndpoint *remote = nullptr) -> void {
+        auto now = timestamp();
+        if (now < nextLog) return;
+        nextLog = now + 5 * NGTCP2_SECONDS;
+        if (remote) {
+            std::println(stderr, "[QUIC/{}] remote={} error={} ({}:{}) retrying UDP submission",
+                operation, *remote, error.message(), error.category().name(), error.value());
+        }
+        else {
+            std::println(stderr, "[QUIC/{}] error={} ({}:{}) retrying UDP operation",
+                operation, error.message(), error.category().name(), error.value());
+        }
+    }
+};
+
 } // namespace
 
 auto make_error_code(QuicError error) noexcept -> std::error_code {
@@ -148,6 +187,14 @@ struct PacketBatch {
     bool padding = false;
 };
 
+struct PendingPackets {
+    SkBuffer bytes;
+    PacketBatch batch;
+    size_t segment = 0;
+    size_t completed = 0;
+    unsigned int ecn = 0;
+};
+
 struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
     std::shared_ptr<SkBufferPool> pool;
     std::weak_ptr<ContextState> context;
@@ -164,6 +211,10 @@ struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
     uint64_t credit = 0;
     int64_t nextStream = -1;
     PacketBatch *writingBatch = nullptr; // Only set during synchronous packet generation.
+    std::optional<PendingPackets> pending;
+    UdpBackoff sendBackoff;
+    ngtcp2_tstamp retryAt = 0;
+    ngtcp2_tstamp retryUntil = 0;
     bool server = false;
     bool handshake = false;
     bool queued = false;
@@ -217,6 +268,10 @@ struct ContextState {
         }
         stopped = true;
         error = value;
+        if (value != std::errc::operation_canceled && value != ilias::SystemError::Canceled) {
+            std::println(stderr, "[QUIC/Context] stopped: {} ({}:{})",
+                value.message(), value.category().name(), value.value());
+        }
         for (auto &connection : connections) {
             if (!connection->error) {
                 connection->closeRequested = true;
@@ -228,6 +283,7 @@ struct ContextState {
         }
         changed.set();
         wake.set();
+        timerChanged.set();
     }
 
     auto notify() -> void {
@@ -252,6 +308,18 @@ struct ContextState {
         });
     }
 };
+
+#ifdef HAJIMI_QUIC_TESTING
+static thread_local UdpBatchSocket::FaultInjector nextBindFault;
+
+auto ContextTestAccess::setNextBindFault(UdpBatchSocket::FaultInjector fault) -> void {
+    nextBindFault = std::move(fault);
+}
+
+auto ContextTestAccess::setFaultInjector(QuicContext &context, UdpBatchSocket::FaultInjector fault) -> void {
+    context.mState->socket.setFaultInjector(std::move(fault));
+}
+#endif
 
 auto ConnectionState::wake() noexcept -> void {
     if (auto owner = context.lock()) {
@@ -709,6 +777,32 @@ static auto writePacket(ngtcp2_conn *, ngtcp2_path *path, ngtcp2_pkt_info *pi,
     return n;
 }
 
+static auto sendPending(const std::shared_ptr<ContextState> &context,
+    const std::shared_ptr<ConnectionState> &state) -> IoTask<void> {
+    auto &pending = *state->pending;
+    auto bytes = ilias::makeBuffer(pending.bytes.data()).subspan(pending.completed * pending.segment);
+    auto sent = co_await context->socket.send(bytes, state->remote, std::min(pending.segment, bytes.size()), pending.ecn);
+    auto end = pending.completed + sent.datagrams;
+    assert(end <= pending.batch.count);
+    for (size_t i = pending.completed; i < end; ++i) {
+        auto &receipt = pending.batch.receipts[i];
+        if (receipt.stream) {
+            receipt.stream->sent = std::max(receipt.stream->sent, receipt.offset);
+            receipt.stream->finSent |= receipt.fin;
+        }
+    }
+    pending.completed = end;
+    state->notify();
+    // Only a rejected MTU probe can be discarded as a local packet loss.
+    auto probe = sent.error == ilias::SystemError::MessageTooLarge &&
+        pending.batch.count == 1 && !pending.batch.receipts[0].stream &&
+        pending.bytes.size() > NGTCP2_MAX_UDP_PAYLOAD_SIZE;
+    if (sent.error && !probe) co_return Err(sent.error);
+    ngtcp2_conn_update_pkt_tx_time(state->conn, timestamp());
+    state->pending.reset();
+    co_return {};
+}
+
 static auto sendPackets(const std::shared_ptr<ContextState> &context,
     const std::shared_ptr<ConnectionState> &state) -> IoTask<void> {
     if (state->closeRequested && !state->draining) {
@@ -738,8 +832,10 @@ static auto sendPackets(const std::shared_ptr<ContextState> &context,
         state->notify();
     }
     if (state->error) {
+        state->pending.reset();
         co_return {};
     }
+    if (state->pending) co_return co_await sendPending(context, state);
     applyStreamChanges(*state);
     if (state->error) co_return {};
     // One bounded quantum per connection; all buffers survive asynchronous I/O.
@@ -761,31 +857,33 @@ static auto sendPackets(const std::shared_ptr<ContextState> &context,
         co_return {};
     }
     if (n == 0) co_return {};
-    auto sent = co_await context->socket.send(ilias::makeBuffer(packet.data(), n), state->remote, segment, pi.ecn);
-    for (size_t i = 0; i < sent.datagrams; ++i) {
-        auto &receipt = batch.receipts[i];
-        if (receipt.stream) {
-            receipt.stream->sent = std::max(receipt.stream->sent, receipt.offset);
-            receipt.stream->finSent |= receipt.fin;
-        }
-    }
-    // A rejected MTU probe is a lost packet, not a failed UDP endpoint.
-    if (sent.error && (sent.error != ilias::SystemError::MessageTooLarge ||
-        batch.count != 1 || batch.receipts[0].stream || n <= NGTCP2_MAX_UDP_PAYLOAD_SIZE)) {
-        state->notify();
-        co_return Err(sent.error);
-    }
-    ngtcp2_conn_update_pkt_tx_time(state->conn, timestamp());
-    state->notify();
-    co_return {};
+    buffer.commitBack(n);
+    state->pending.emplace(PendingPackets{std::move(buffer), std::move(batch), segment, 0, pi.ecn});
+    co_return co_await sendPending(context, state);
 }
 
 static auto receiveWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
     size_t handled = 0;
     auto turn = timestamp();
+    UdpBackoff backoff;
     while (!state->stopped) {
         co_await ilias::this_coro::stopPoint();
-        ILIAS_CO_TRY(auto received, co_await state->socket.receive());
+        auto result = co_await state->socket.receive();
+        if (!result) {
+            auto error = result.error();
+            if (state->stopped) break;
+            if (!retryableUdpError(error)) {
+                std::println(stderr, "[QUIC/Recv] error={} ({}:{})",
+                    error.message(), error.category().name(), error.value());
+                state->stop(error); // Save the cause before finally() performs shutdown.
+                co_return Err(error);
+            }
+            backoff.report("Recv", error);
+            co_await ilias::sleep(std::chrono::nanoseconds(backoff.delay()));
+            continue;
+        }
+        backoff.failures = 0;
+        auto received = *result;
         if (state->stopped) {
             break;
         }
@@ -822,14 +920,64 @@ static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
         auto connections = state->connections;
         auto turn = now;
         for (auto &connection : connections) {
+            if (state->stopped) break;
             now = timestamp();
-            if (!connection->error && ngtcp2_conn_get_expiry2(connection->conn) <= now) {
+            if (connection->pending && connection->error) {
+                connection->pending.reset();
+                connection->retryAt = connection->retryUntil = 0;
+            }
+            if (connection->retryUntil && now >= connection->retryUntil) {
+                connection->fail(std::make_error_code(std::errc::timed_out));
+                connection->draining = true;
+                connection->closeRequested = false;
+                connection->pending.reset();
+                connection->retireAt = now;
+                connection->retryAt = connection->retryUntil = 0;
+                connection->notify();
+                std::println(stderr, "[QUIC/Send] remote={} UDP retry deadline reached; connection retired",
+                    connection->remote);
+                continue;
+            }
+            if (connection->retryAt > now) continue;
+            // Do not generate retransmissions while an encoded batch is still pending.
+            // Its retry deadline bounds this delay even if the route never recovers.
+            if (!connection->pending && !connection->error && ngtcp2_conn_get_expiry2(connection->conn) <= now) {
                 connection->handleError(ngtcp2_conn_handle_expiry(connection->conn, now));
             }
             auto sent = co_await sendPackets(state, connection);
             if (!sent) {
-                state->stop(sent.error());
-                co_return Err(sent.error());
+                if (state->stopped) break;
+                auto error = sent.error();
+                if (retryableUdpError(error)) {
+                    connection->sendBackoff.report("Send", error, &connection->remote);
+                    now = timestamp();
+                    if (!connection->retryUntil) {
+                        auto timeout = connection->handshake ? state->config.idleTimeout : state->config.handshakeTimeout;
+                        connection->retryUntil = now + timeout.count() * NGTCP2_MILLISECONDS;
+                    }
+                    connection->retryAt = std::min(connection->retryUntil, now + connection->sendBackoff.delay());
+                }
+                else {
+                    std::println(stderr, "[QUIC/Send] remote={} error={} ({}:{})",
+                        connection->remote, error.message(), error.category().name(), error.value());
+                    using E = ilias::SystemError;
+                    if (error.category() != quicErrorCategory && error != E::AddressFamilyNotSupported &&
+                        error != E::DestinationAddressRequired) {
+                        state->stop(error);
+                        co_return Err(error);
+                    }
+                    connection->fail(error);
+                    connection->draining = true;
+                    connection->closeRequested = false;
+                    connection->pending.reset();
+                    connection->retireAt = timestamp();
+                    connection->retryAt = connection->retryUntil = 0;
+                    connection->notify();
+                }
+            }
+            else {
+                connection->retryAt = connection->retryUntil = 0;
+                connection->sendBackoff.failures = 0;
             }
             if (timestamp() - turn >= 250 * NGTCP2_MICROSECONDS) {
                 co_await ilias::this_coro::yield();
@@ -842,8 +990,9 @@ static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
         }
         auto deadline = timestamp() + NGTCP2_SECONDS;
         for (auto &connection : state->connections) {
-            deadline = std::min(deadline, connection->retireAt ? connection->retireAt :
-                ngtcp2_conn_get_expiry2(connection->conn));
+            auto next = connection->retryAt ? connection->retryAt : connection->retireAt ? connection->retireAt :
+                ngtcp2_conn_get_expiry2(connection->conn);
+            deadline = std::min(deadline, next);
         }
         state->deadline = deadline;
         if (!state->armedDeadline || deadline < state->armedDeadline) state->timerChanged.set();
@@ -895,6 +1044,7 @@ static auto runContext(std::shared_ptr<ContextState> state) -> IoTask<void> {
     ScopeExit cleanup{[&]() {
         state->stop(std::make_error_code(std::errc::operation_canceled));
         state->socket.close();
+        for (auto &connection : state->connections) connection->pending.reset();
         state->incoming.clear();
         state->routes.clear();
         state->connections.clear();
@@ -963,6 +1113,9 @@ auto QuicContext::bind(IPEndpoint local, Config config) -> IoTask<QuicContext> {
     }
     ILIAS_CO_TRYV(socket.bind(local));
     ILIAS_CO_TRY(state->socket, quic::UdpBatchSocket::from(std::move(socket), *state->pool, state->config.udpBatching));
+#ifdef HAJIMI_QUIC_TESTING
+    state->socket.setFaultInjector(std::exchange(quic::nextBindFault, {}));
+#endif
     ILIAS_CO_TRY(state->local, state->socket.localEndpoint());
     co_return QuicContext{std::move(state)};
 }
@@ -1193,6 +1346,9 @@ auto QuicConnection::close(uint64_t appError) -> IoTask<void> {
     }
     state->close(appError);
     while (!state->closeSent) {
+        if (state->draining && !state->closeRequested) {
+            co_return Err(state->error);
+        }
         auto owner = state->context.lock();
         if (!owner || owner->stopped) {
             co_return Err(owner ? owner->error : make_error_code(QuicError::ConnectionClosed));
