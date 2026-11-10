@@ -14,6 +14,16 @@ ApplicationWindow {
     title: "Hajimi"
     Component.onCompleted: root.appController.checkNetwork()
 
+    function serverAddress(ip, port) {
+        return (ip.indexOf(":") >= 0 ? "[" + ip + "]" : ip) + ":" + port
+    }
+
+    Connections {
+        target: root.appController
+        function onWebuiUrlChanged() { webAddress.text = root.appController.webuiUrl.toString() }
+        function onWebuiReloadRequested() { if (webLoader.item) webLoader.item.reload() }
+    }
+
     header: ToolBar {
         RowLayout {
             anchors.fill: parent
@@ -39,44 +49,81 @@ ApplicationWindow {
                 }
                 Menu {
                     id: addressMenu
+                    width: 360
                     Menu {
                         title: "IPv6 / DuckDNS"
+                        width: Math.min(root.width - 32, Math.max(320, ipv6HintItem.implicitWidth))
                         MenuItem {
-                            text: "填入 WebUI 地址（8848）"
-                            onTriggered: { tabs.currentIndex = 0; webAddress.text = "http://busystudent-pi.duckdns.org:8848/" }
+                            text: "复制域名"
+                            onTriggered: root.appController.copyToClipboard("busystudent-pi.duckdns.org")
                         }
                         MenuItem {
-                            text: "复制 WebUI 地址"
-                            onTriggered: root.appController.copyToClipboard("http://busystudent-pi.duckdns.org:8848/")
-                        }
-                        MenuItem {
-                            text: "复制客户端地址（1145）"
-                            onTriggered: root.appController.copyToClipboard("busystudent-pi.duckdns.org:1145")
+                            text: root.appController.resolvingIpv6 ? "解析中…" : "解析 IPv6（系统 DNS）"
+                            enabled: !root.appController.resolvingIpv6
+                            onTriggered: root.appController.resolveIpv6()
                         }
                         MenuSeparator {}
-                        MenuItem { text: root.appController.ipv6Hint; enabled: false }
+                        MenuItem {
+                            text: "填入 WebUI IP 地址（8848）"
+                            enabled: root.appController.ipv6Address.length > 0
+                            onTriggered: {
+                                tabs.currentIndex = 0
+                                webAddress.text = "http://" + root.serverAddress(root.appController.ipv6Address, 8848) + "/"
+                            }
+                        }
+                        MenuItem {
+                            text: "复制 WebUI IP 地址"
+                            enabled: root.appController.ipv6Address.length > 0
+                            onTriggered: root.appController.copyToClipboard(
+                                "http://" + root.serverAddress(root.appController.ipv6Address, 8848) + "/")
+                        }
+                        MenuItem {
+                            text: "复制客户端 IP 地址（1145）"
+                            enabled: root.appController.ipv6Address.length > 0
+                            onTriggered: root.appController.copyToClipboard(root.serverAddress(root.appController.ipv6Address, 1145))
+                        }
+                        MenuSeparator {}
+                        MenuItem { id: ipv6HintItem; text: root.appController.ipv6Hint; enabled: false }
                     }
                     Menu {
                         title: "Tailscale / pi.tail12b2a2.ts.net"
+                        width: Math.min(root.width - 32, Math.max(320, tailscaleHintItem.implicitWidth))
                         MenuItem {
-                            text: "填入 WebUI 地址（8848）"
-                            onTriggered: { tabs.currentIndex = 0; webAddress.text = "http://pi.tail12b2a2.ts.net:8848/" }
+                            text: "复制域名"
+                            onTriggered: root.appController.copyToClipboard("pi.tail12b2a2.ts.net")
                         }
                         MenuItem {
-                            text: "复制 WebUI 地址"
-                            onTriggered: root.appController.copyToClipboard("http://pi.tail12b2a2.ts.net:8848/")
-                        }
-                        MenuItem {
-                            text: "复制客户端地址（1145）"
-                            onTriggered: root.appController.copyToClipboard("pi.tail12b2a2.ts.net:1145")
+                            text: root.appController.resolvingTailscale ? "解析中…" : "解析 IP（tailscale ping）"
+                            enabled: !root.appController.resolvingTailscale
+                            onTriggered: root.appController.resolveTailscale()
                         }
                         MenuSeparator {}
-                        MenuItem { text: root.appController.tailscaleHint; enabled: false }
+                        MenuItem {
+                            text: "填入 WebUI IP 地址（8848）"
+                            enabled: root.appController.tailscaleAddress.length > 0
+                            onTriggered: {
+                                tabs.currentIndex = 0
+                                webAddress.text = "http://" + root.serverAddress(root.appController.tailscaleAddress, 8848) + "/"
+                            }
+                        }
+                        MenuItem {
+                            text: "复制 WebUI IP 地址"
+                            enabled: root.appController.tailscaleAddress.length > 0
+                            onTriggered: root.appController.copyToClipboard(
+                                "http://" + root.serverAddress(root.appController.tailscaleAddress, 8848) + "/")
+                        }
+                        MenuItem {
+                            text: "复制客户端 IP 地址（1145）"
+                            enabled: root.appController.tailscaleAddress.length > 0
+                            onTriggered: root.appController.copyToClipboard(root.serverAddress(root.appController.tailscaleAddress, 1145))
+                        }
+                        MenuSeparator {}
+                        MenuItem { id: tailscaleHintItem; text: root.appController.tailscaleHint; enabled: false }
                     }
                     MenuSeparator {}
                     MenuItem { text: "两条路径均可能不可用，也可手动填写地址"; enabled: false }
                     MenuItem {
-                        text: root.appController.checkingNetwork ? "检查中…" : "检查本机网络"
+                        text: root.appController.checkingNetwork ? "解析中…" : "重新解析两条路径"
                         enabled: !root.appController.checkingNetwork
                         onTriggered: root.appController.checkNetwork()
                     }
@@ -117,16 +164,9 @@ ApplicationWindow {
                     Button {
                         id: openWeb
                         objectName: "openWeb"
-                        text: "加载"
-                        onClicked: {
-                            const previous = root.appController.webuiUrl.toString()
-                            if (!root.appController.loadWebUi(webAddress.text))
-                                return
-                            webAddress.text = root.appController.webuiUrl.toString()
-                            // Reload only the same URL; a changed URL navigates through its binding.
-                            if (previous === root.appController.webuiUrl.toString() && webLoader.item)
-                                webLoader.item.reload()
-                        }
+                        text: root.appController.resolvingWebui ? "解析中…" : "加载"
+                        enabled: !root.appController.resolvingWebui
+                        onClicked: root.appController.loadWebUi(webAddress.text)
                     }
                     Button {
                         text: "刷新"
