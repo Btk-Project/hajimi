@@ -8,31 +8,32 @@
 #include <cassert>
 #include <cstdint>
 #include <string>
-#include <print>
+#include <format>
 #include <array>
 #include <span>
 #include <bit>
 
+#include "utils/overloads.hpp"
 #include "skbuf.hpp"
 
 // MARK: Protocol
 // Current used version (increase it of the protocol changes)
-constexpr auto HAJIMI_VERSION = uint16_t{0x3};
+constexpr auto HAJIMI_VERSION = std::uint16_t{0x4};
 
 // The header size 
-constexpr auto HAJIMI_HEADER = sizeof(uint16_t) + sizeof(uint8_t);
-
-// The max size of the message
-constexpr auto HAJIMI_STORAGE_SIZE = UINT16_MAX + HAJIMI_HEADER;
+constexpr auto HAJIMI_HEADER = sizeof(std::int16_t) + sizeof(std::uint8_t);
 
 // The max size of the payload on data exchange message
-constexpr auto HAJIMI_MAX_DATA_EXCHANGE = UINT16_MAX - sizeof(uint64_t);
+constexpr auto HAJIMI_MAX_DATA_EXCHANGE = UINT16_MAX;
 
-// The init window size of the stream
-constexpr auto HAJIMI_INIT_WINDOW_SIZE = size_t{1024} * 256;
+// The max size of the message in bytes
+constexpr auto HAJIMI_MAX_MESSAGE_SIZE = HAJIMI_MAX_DATA_EXCHANGE + HAJIMI_HEADER;
+
+// The init window size of the stream (only used in tcp)
+constexpr auto HAJIMI_TCP_INIT_WINDOW_SIZE = std::size_t{1024} * 256;
 
 // The header room size (larger than the header size for more safe)
-constexpr auto HAJIMI_HEADER_ROOM = HAJIMI_HEADER + sizeof(uint64_t) * 2;
+constexpr auto HAJIMI_HEADER_ROOM = HAJIMI_HEADER + sizeof(std::uint64_t) * 2;
 
 // The config  of the buffer pool
 constexpr auto HAJIMI_POOL_CONFIG = std::initializer_list<SkBufferPool::ClassInfo> {
@@ -47,20 +48,23 @@ constexpr auto HAJIMI_POOL_CONFIG = std::initializer_list<SkBufferPool::ClassInf
     { 65600,   2 },
 };
 
+// Tcp Mux / Demux
+// u64   streamId (UINT64_MAX for datagram, 0 for control, client -> server 1, 3, 5, ... server -> client 2, 4, 6, ...)
+// u8 [] message
+
 // Each message is packed by
 // u16   size (payload length)
 // u8    type
 // u8 [] payload (whole Hello or DataExchange...)
-//
-// All messages (control and tunnel data) are multiplexed on the same
-// TCP connection, every tunnel data frame is tagged with a u64 streamId.
+
+// The first stream opened in the connection is the control stream
 
 // Hello from client
 // u16   version
 // u8 [] name
 struct Hello {
-    uint16_t version;
-    std::string name;
+    std::uint16_t version;
+    std::string   name;
 };
 
 // HelloAck from server, the registration is accepted (no payload)
@@ -72,57 +76,62 @@ struct Pong {};
 
 // OpenTunnel between client <-> server
 // The tunnel is logical exist before the TunnelClose message
-// u64   streamId
-// u8 [] host:port
+// u8 [] host
+// u16   port
 struct OpenTunnel {
-    uint64_t streamId;    // Id of the tunnel (if server -> client, the id should be even, otherwise odd)
-    std::string endpoint;
+    std::string   addr;
+    std::uint16_t port;
 };
 
 // DataExchange between client <-> server
-// u64   streamId
 // u8 [] data
 struct DataExchange {
-    uint64_t streamId;
     SkBuffer data; // The message of the data (must alloced with the headroom of HAJIMI_HEADER_ROOM if send to writeMessage)
 };
 
 // WindowUpdate between client <-> server
-// u64 streamId
 // u32 size
 struct WindowUpdate {
-    uint64_t streamId;
-    uint32_t size; //< Incerase the sending window
+    std::uint32_t size; //< Incerase the sending window
 };
 
 // TunnelClose between client <-> server, the tunnel is gone (idempotent)
-// u64   streamId
-struct TunnelClose {
-    uint64_t streamId;
-};
+struct TunnelClose {};
+
+// TunnelShutdown between client <-> server, the send part of the tunnel is gone (half closed)
+struct TunnelShutdown {};
 
 // FatalError between client <-> server, if received, the connection is gone
+// u32 code
 // u8 [] msg
 struct FatalError {
-    std::string msg;
+    std::uint32_t code;
+    std::string   msg;
+};
+
+// TODO:
+struct DatagramExchange {
+
 };
 
 // The type of the Message
 enum class MessageType : uint8_t {
-    Hello         = 1, // Client -> Server, register
-    HelloAck      = 2, // Server -> Client, registration accepted
-    Ping          = 3, // Both, heartbeat ping
-    Pong          = 4, // Both, heartbeat ack
-    OpenTunnel    = 5, // Server -> Client, Try Open a tunnel
-    DataExchange  = 7, // Both, tunnel data
-    TunnelClose   = 8, // Both, tunnel closed
-    WindowUpdate  = 9, // Both, tunnel send window update
-    FatalError    = 255,
-};
+    // Control
+    Hello         = 1,   // Client -> Server, register
+    HelloAck      = 2,   // Server -> Client, registration accepted
+    Ping          = 3,   // Both, heartbeat ping
+    Pong          = 4,   // Both, heartbeat ack
+    FatalError    = 255, // Both, fatal error
 
-// MARK: Utils
-template <typename ...Ts>
-struct Overloads : Ts... { using Ts::operator()...; };
+    // Tunnel
+    OpenTunnel     = 10,   // Server <-> Client, Try Open a tunnel
+
+    // Tunnel, Tcp Only
+    DataExchange   = 100, // Both, tunnel data
+    TunnelClose    = 101, // Both, tunnel closed
+    TunnelShutdown = 102, // Both, tunnel shutdown
+    WindowUpdate   = 103, // Both, tunnel send window update  
+};
 
 // The message union
 struct Message {
@@ -132,11 +141,12 @@ public:
         HelloAck,
         Ping,
         Pong,
+        FatalError,
         OpenTunnel,
         DataExchange,
         TunnelClose,
-        WindowUpdate,
-        FatalError
+        TunnelShutdown,
+        WindowUpdate
     >;
 
     Message(const Message &) = delete;
@@ -163,18 +173,22 @@ public:
             [](const HelloAck &) { return MessageType::HelloAck; },
             [](const Ping &) { return MessageType::Ping; },
             [](const Pong &) { return MessageType::Pong; },
+            [](const FatalError &) { return MessageType::FatalError; },
             [](const OpenTunnel &) { return MessageType::OpenTunnel; },
             [](const DataExchange &) { return MessageType::DataExchange; },
             [](const TunnelClose &) { return MessageType::TunnelClose; },
+            [](const TunnelShutdown &) { return MessageType::TunnelShutdown; },
             [](const WindowUpdate &) { return MessageType::WindowUpdate; },
-            [](const FatalError &) { return MessageType::FatalError; },
         }, mStorage);
     }
 
     // Visit the message
-    template <typename T>
-    auto visit(T &&visitor) {
-        return std::visit(std::forward<T>(visitor), mStorage);
+    template<class F>
+    decltype(auto) visit(this auto&& self, F &&f) {
+        return std::visit(
+            std::forward<F>(f),
+            std::forward<decltype(self)>(self).mStorage
+        );
     }
 
     // Operator
@@ -183,225 +197,104 @@ private:
     Storage mStorage;
 };
 
-// MARK: Deserilize
-class MessageReader {
+/**
+ * @brief The control message
+ * 
+ */
+class ControlMessage {
 public:
-    MessageReader(ilias::ReadableView stream, SkBufferPool &pool) : mStream(stream), mPool(pool) {}
-    MessageReader(MessageReader &&) = default;
+    using Storage = std::variant<
+        Hello,
+        HelloAck,
+        Ping,
+        Pong,
+        FatalError
+    >;
 
-    // Read the header and payload into the storage, return the Message
-    auto readMessage() -> ilias::IoTask<Message>;
+    ControlMessage(const ControlMessage &) = delete;
+    ControlMessage(ControlMessage &&) = default;
+
+    // Construct inner
+    template <typename T>
+    ControlMessage(T &&v) : mStorage(std::forward<T>(v)) {}
+
+    // As same as message
+    template <typename T>
+    auto cast() -> ilias::IoResult<T> {
+        if (std::holds_alternative<T>(mStorage)) {
+            return std::get<T>(std::move(mStorage));
+        }
+        // Doesn't expected
+        return ilias::Err(std::make_error_code(std::errc::bad_message));
+    }
+
+    // Visit the message
+    template <typename T>
+    auto visit(T &&visitor) {
+        return std::visit(std::forward<T>(visitor), mStorage);
+    }
+
+    auto type() const noexcept -> MessageType {
+        return std::visit(Overloads {
+            [](const Hello &) { return MessageType::Hello; },
+            [](const HelloAck &) { return MessageType::HelloAck; },
+            [](const Ping &) { return MessageType::Ping; },
+            [](const Pong &) { return MessageType::Pong; },
+            [](const FatalError &) { return MessageType::FatalError; },
+        }, mStorage);
+    }
+
+    // Operator
+    auto operator =(ControlMessage &&) -> ControlMessage & = default;
+
+    // Cast to Message, message is a superset of control message
+    auto toMessage() -> Message {
+        return std::visit(Overloads {
+            [](Hello v) { return Message{std::move(v)}; },
+            [](HelloAck v) { return Message{std::move(v)}; },
+            [](Ping v) { return Message{std::move(v)}; },
+            [](Pong v) { return Message{std::move(v)}; },
+            [](FatalError v) { return Message{std::move(v)}; },
+        }, std::move(mStorage));
+    }
+
+    static auto fromMessage(Message msg) -> std::optional<ControlMessage> {
+        return std::move(msg).visit(Overloads {
+            [](Hello v) -> std::optional<ControlMessage> { return std::move(v); },
+            [](HelloAck v) -> std::optional<ControlMessage> { return std::move(v); },
+            [](Ping v) -> std::optional<ControlMessage> { return std::move(v); },
+            [](Pong v) -> std::optional<ControlMessage> { return std::move(v); },
+            [](FatalError v) -> std::optional<ControlMessage> { return std::move(v); },
+            [](auto &&) -> std::optional<ControlMessage> { return std::nullopt; },
+        });
+    }
 private:
-    static auto parse(uint8_t type, SkBuffer &buffer) -> std::optional<Message>;
-
-    ilias::ReadableView mStream;
-    SkBufferPool       &mPool; // The pool for the message
-    SkBuffer            mBuffer; // The current used buffer
+    Storage mStorage;
 };
 
-inline auto MessageReader::readMessage() -> ilias::IoTask<Message> {
-    std::byte header[HAJIMI_HEADER] {};
-    ILIAS_CO_TRYV(co_await mStream.readAll(header));
-
-    uint16_t len = std::to_integer<uint16_t>(header[0]) << 8 | std::to_integer<uint16_t>(header[1]);
-    uint8_t type = std::to_integer<uint8_t>(header[2]);
-
-    if (len != 0) {
-        if (mBuffer.capacity() < len) {
-            mBuffer = mPool.allocate(len);
-        }
-        mBuffer.clear();
-        auto span = mBuffer.prepareBack(len);
-        ILIAS_CO_TRYV(co_await mStream.readAll(span));
-        mBuffer.commitBack(len);
+// Print for MessageType
+template <>
+struct std::formatter<MessageType> {
+    constexpr auto parse(std::format_parse_context &ctxt) -> decltype(ctxt.begin()) {
+        return ctxt.begin();
     }
-    if (auto msg = parse(type, mBuffer)) {
-        co_return std::move(*msg);
-    }
-    co_return ilias::Err(std::make_error_code(std::errc::bad_message));
-}
 
-inline auto MessageReader::parse(uint8_t type, SkBuffer &buffer) -> std::optional<Message> {
-    switch (static_cast<MessageType>(type)) {
-        case MessageType::Hello: {
-            ILIAS_TRY(auto version, buffer.popIntBE<uint16_t>());
-            ILIAS_TRY(auto name, buffer.popString());
-
-            // std::println("[Protocol] Hello: {}, {}", version, name);
-            return Message {
-                Hello {
-                    .version = version,
-                    .name = std::move(name),
-                }
-            };
-        }
-
-        case MessageType::HelloAck: {
-            // std::println("[Protocol] HelloAck");
-            return Message { HelloAck{} };
-        }
-
-        case MessageType::Ping: {
-            // std::println("[Protocol] Ping");
-            return Message { Ping{} };
-        }
-
-        case MessageType::Pong: {
-            // std::println("[Protocol] Pong");
-            return Message { Pong{} };
-        }
-
-        case MessageType::OpenTunnel: {
-            ILIAS_TRY(auto streamId, buffer.popIntBE<uint64_t>());
-            ILIAS_TRY(auto endpoint, buffer.popString());
-            // std::println("[Protocol] OpenTunnel {} => {}", streamId, endpoint);
-            return Message {
-                OpenTunnel {
-                    .streamId = streamId,
-                    .endpoint = std::move(endpoint)
-                }
-            };
-        }
-
-        case MessageType::TunnelClose: {
-            ILIAS_TRY(auto streamId, buffer.popIntBE<uint64_t>());
-            // std::println("[Protocol] TunnelClose {}", streamId);
-            return Message {
-                TunnelClose {
-                    .streamId = streamId,
-                }
-            };
-        }
-
-        case MessageType::DataExchange: {
-            ILIAS_TRY(auto streamId, buffer.popIntBE<uint64_t>());
-            // std::println("[Protocol] DataExchange {}, {} bytes", streamId, data.size());
-            return Message {
-                DataExchange {
-                    .streamId = streamId,
-                    .data = std::exchange(buffer, SkBuffer{}),
-                }
-            };
-        }
-
-        case MessageType::WindowUpdate: {
-            ILIAS_TRY(auto streamId, buffer.popIntBE<uint64_t>());
-            ILIAS_TRY(auto size, buffer.popIntBE<uint32_t>());
-            // std::println("[Protocol] WindowUpdate {}, {} bytes", streamId, size);
-            return Message {
-                WindowUpdate {
-                    .streamId = streamId,
-                    .size = size
-                }
-            };
-        }
-
-        case MessageType::FatalError: {
-            ILIAS_TRY(auto msg, buffer.popString());
-            // std::println("[Protocol] FatalError {}", msg);
-            return Message {
-                FatalError {
-                    .msg = std::move(msg)
-                }  
-            };
-        }
-        default: {
-            std::println(stderr, "[Message] readMessage, invalid type: {}", type);
-            return std::nullopt;
-        }
-    }
-}
-
-// MARK: Serilize
-class MessageWriter {
-public:
-    MessageWriter(ilias::WritableView stream, SkBufferPool &pool) : mStream(stream), mPool(pool) {
-        mBuffer = mPool.allocate(256); // A Small buffer for tiny control message
-    }
-    MessageWriter(MessageWriter &&) = default;
-
-    auto writeMessage(Message msg) -> ilias::IoTask<void>;
-private:
-    ilias::WritableView  mStream;
-    SkBufferPool        &mPool; // The pool for the message
-    SkBuffer             mBuffer;
-};
-
-inline auto MessageWriter::writeMessage(Message msg) -> ilias::IoTask<void> {
-    // The number of bytes of the message
-    mBuffer.clear();
-    mBuffer.reserveHead(HAJIMI_HEADER_ROOM);
-
-    switch (msg.type()) {
-        case MessageType::Hello: {
-            auto hello = msg.cast<Hello>().value();
-            mBuffer.appendIntBE(hello.version);
-            mBuffer.append(ilias::makeBuffer(hello.name));
-            break;
-        }
-        case MessageType::HelloAck: break; // No-payload
-        case MessageType::Ping: break;
-        case MessageType::Pong: break;
-
-        case MessageType::OpenTunnel: {
-            auto tunnel = msg.cast<OpenTunnel>().value();
-            mBuffer.appendIntBE(tunnel.streamId);
-            mBuffer.append(ilias::makeBuffer(tunnel.endpoint));
-            break;
-        }
-         case MessageType::DataExchange: {
-            auto exchange = msg.cast<DataExchange>().value();
-            auto buffer = std::exchange(exchange.data, SkBuffer{});
-            // We just use the message buffer, avoid the copy
-            // len | type | streamId | data |
-            assert(buffer.headroom() >= HAJIMI_HEADER_ROOM && "This buffer is too small");
-            if (buffer.size() > HAJIMI_MAX_DATA_EXCHANGE || buffer.headroom() < HAJIMI_HEADER_ROOM) [[unlikely]] {
-                co_return ilias::Err(std::make_error_code(std::errc::bad_message));
+    auto format(MessageType type, std::format_context &ctxt) const -> decltype(ctxt.out()) {
+        auto str = [&]() -> std::string_view {
+            switch (type) {
+                case MessageType::Hello: return "Hello";
+                case MessageType::HelloAck: return "HelloAck";
+                case MessageType::Ping: return "Ping";
+                case MessageType::Pong: return "Pong";
+                case MessageType::FatalError: return "FatalError";
+                case MessageType::OpenTunnel: return "OpenTunnel";
+                case MessageType::DataExchange: return "DataExchange";
+                case MessageType::TunnelClose: return "TunnelClose";
+                case MessageType::TunnelShutdown: return "TunnelShutdown";
+                case MessageType::WindowUpdate: return "WindowUpdate";
+                default: return "Unknown";
             }
-
-            buffer.prependIntBE(exchange.streamId);
-            auto size = buffer.size(); // The size only contains streamId + data
-
-            buffer.prependIntBE(static_cast<uint8_t>(MessageType::DataExchange));
-            buffer.prependIntBE(static_cast<uint16_t>(size));
-
-            // Write it
-            ILIAS_CO_TRYV(co_await mStream.writeAll(buffer.data()));
-            co_return co_await mStream.flush();
-        }
-
-        case MessageType::TunnelClose: {
-            auto close = msg.cast<TunnelClose>().value();
-            mBuffer.appendIntBE(close.streamId);
-            break;
-        }
-
-        case MessageType::WindowUpdate: {
-            auto update = msg.cast<WindowUpdate>().value();
-            mBuffer.appendIntBE(update.streamId);
-            mBuffer.appendIntBE(update.size);
-            break;
-        }
-
-        case MessageType::FatalError: {
-            auto err = msg.cast<FatalError>().value();
-            mBuffer.append(ilias::makeBuffer(err.msg));
-            break;
-        }
-
-        default: { // Unsupported now
-            assert(false && "TODO: Currently not impl");
-        }
+        }();
+        return std::format_to(ctxt.out(), "{}", str);
     }
-    // Store how many bytes we are used
-    auto size = mBuffer.size();
-
-    // | Size | Type | Data |
-    mBuffer.prependIntBE(static_cast<uint8_t>(msg.type()));
-    mBuffer.prependIntBE(static_cast<uint16_t>(size));
-
-    // Write a;;
-    ILIAS_CO_TRYV(co_await mStream.writeAll(mBuffer.data()));
-    ILIAS_CO_TRYV(co_await mStream.flush());
-    co_return {};
-}
+};

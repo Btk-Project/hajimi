@@ -15,6 +15,7 @@ using ilias::Mutex;
 
 // Forward
 class ProxyClient;
+class HajimiConnection;
 
 /**
  * @brief The proxy client
@@ -48,7 +49,8 @@ public:
 private:
     // Connect, register, dispatch messages until the connection breaks
     auto connectOnce(bool &registered, void *quicContext) -> IoTask<void>;
-    auto runOnce(bool &registered, StreamView stream) -> IoTask<void>;
-
+    auto runOnce(bool &registered, HajimiConnection conn) -> IoTask<void>;
+    auto runImpl(bool &registered, HajimiConnection &conn) -> IoTask<void>;
+    
     Config mConfig;
 };

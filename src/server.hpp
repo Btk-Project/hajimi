@@ -11,6 +11,7 @@
 #include <map>
 
 #include "utils/allocator.hpp"
+#include "transport.hpp"
 #include "duckdns.hpp"
 
 // Import
@@ -22,6 +23,7 @@ using ilias::IoTask;
 using ilias::Result;
 
 // Forward
+class HajimiConnection;
 class ClientSession;
 class ProxyRule;
 
@@ -93,7 +95,8 @@ public:
 private:
     auto runTcp() -> IoTask<void>;
     auto runQuic() -> IoTask<void>;
-    auto handleSession(DynStream stream, IPEndpoint remoteEndpoint, std::string tag) -> IoTask<void>;
+    auto handleSession(HajimiConnection &conn, IPEndpoint remoteEndpoint, std::string tag) -> IoTask<void>;
+    auto handleSessionImpl(HajimiConnection &conn, IPEndpoint remoteEndpoint, std::string tag) -> IoTask<void>;
 
 
     Config mConfig;

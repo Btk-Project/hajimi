@@ -174,6 +174,12 @@ public:
     SkBuffer(SkBuffer &&) noexcept = default;
     SkBuffer() = default;
 
+    // Construct by existing data
+    explicit SkBuffer(std::span<const std::byte> data, SkBufferPool &pool) {
+        (*this) = pool.allocate(data.size());
+        this->append(data);
+    }
+
     // Check the buffer is unique?
     [[nodiscard]]
     auto unique() const -> bool {
