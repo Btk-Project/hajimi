@@ -210,7 +210,7 @@ auto MessageWriter::writeMessage(Message msg) -> SkBuffer & {
 struct HajimiTunnel {
     using Ptr = std::shared_ptr<HajimiTunnel>;
 
-    HajimiTunnel(std::uint64_t streamId) : id(streamId) {
+    explicit HajimiTunnel(std::uint64_t streamId) : id(streamId) {
         auto [sender, receiver] = mpsc::channel<SkBuffer>(); // Bounded by recvWindow
         bytesSender = std::move(sender);
         bytesReceiver = std::move(receiver);
@@ -253,7 +253,7 @@ struct HajimiTransportStream {
         HajimiTunnel::Ptr tunnel;
     };
 
-    HajimiTransportStream(SkBufferPool &bufferPool, DynStream bytes, bool client) :
+    explicit HajimiTransportStream(SkBufferPool &bufferPool, DynStream bytes, bool client) :
         pool(bufferPool), stream(std::move(bytes)), nextId(client ? 1 : 2) // Client starts with 1, server with 0 (0 for control messages)
     {
         auto [tunnelSender, tunnelReceiver] = mpsc::channel<PendingTunnel>();
@@ -308,10 +308,27 @@ struct HajimiTransportStream {
     auto stop(std::error_code ec) -> void;
 };
 
+// MARK: TransportQuic
 #ifdef HAJIMI_QUIC
 struct HajimiTransportQuic {
+    explicit HajimiTransportQuic(SkBufferPool &p, QuicConnection c, QuicStream stream) : 
+        pool(p), 
+        conn(std::move(c)), 
+        control(std::move(stream)),
+        writer(pool)
+    {
+        
+    }
+
     SkBufferPool &pool;
-    QuicConnection conn;  
+    QuicConnection conn;
+    HajimiConnection::Status status;
+
+    // The control stream
+    QuicStream  control; 
+    MessageWriter writer;
+    ilias::Mutex writeMutex; // Protect the writer & control stream write part
+    SkBuffer readBuffer; // Cacheed read buffer
 };
 #endif // HAJIMI_QUIC
 
@@ -320,18 +337,25 @@ struct HajimiTransportQuic {
 // Union
 struct HajimiConnection::Impl : std::variant<
     HajimiTransportStream
-    // , HajimiTransportQuic
+#ifdef HAJIMI_QUIC
+    ,
+    HajimiTransportQuic
+#endif // HAJIMI_QUIC
 > { 
     using variant::variant;
 };
 
 struct HajimiStream::Impl : std::variant<
     HajimiTunnel::Ptr
-    // , QuicStream
+#ifdef HAJIMI_QUIC
+    ,
+    QuicStream
+#endif // HAJIMI_QUIC
 > { 
     using variant::variant;
 };
 
+// MARK: HajimiConnection
 // Hajimi over stream (tcp)
 auto HajimiConnection::fromServer(SkBufferPool &pool, DynStream stream) -> IoTask<HajimiConnection> {
     HajimiConnection conn;
@@ -345,81 +369,210 @@ auto HajimiConnection::fromClient(SkBufferPool &pool, DynStream stream) -> IoTas
     co_return conn;
 }
 
+// Hajimi over quic
+#ifdef HAJIMI_QUIC
+auto HajimiConnection::fromServer(SkBufferPool &pool, QuicConnection quic) -> IoTask<HajimiConnection> {
+    // Accept the control stream
+    ILIAS_CO_TRY(auto control, co_await quic.acceptStream());
+    HajimiConnection conn;
+    conn.d = std::make_shared<Impl>(std::in_place_type<HajimiTransportQuic>, pool, std::move(quic), std::move(control));
+    co_return conn;
+}
+
+auto HajimiConnection::fromClient(SkBufferPool &pool, QuicConnection quic) -> IoTask<HajimiConnection> {
+    // Open the control stream
+    ILIAS_CO_TRY(auto control, co_await quic.openStream());
+    HajimiConnection conn;
+    conn.d = std::make_shared<Impl>(std::in_place_type<HajimiTransportQuic>, pool, std::move(quic), std::move(control));
+    co_return conn;
+}
+#endif // HAJIMI_QUIC
+
 HajimiConnection::~HajimiConnection() {
 
 }
 
 auto HajimiConnection::readMessage() -> IoTask<ControlMessage> {
-    auto &transport = std::get<HajimiTransportStream>(*d);
-    if (transport.error) {
-        co_return Err(transport.error);
-    }
+    if (auto transport = std::get_if<HajimiTransportStream>(d.get())) { // Stream
+        if (transport->error) {
+            co_return Err(transport->error);
+        }
 
-    auto msg = co_await transport.inMessageReceiver.recv();
-    if (!msg) {
-        co_return Err(std::make_error_code(std::errc::connection_aborted));
+        auto msg = co_await transport->inMessageReceiver.recv();
+        if (!msg) {
+            co_return Err(std::make_error_code(std::errc::connection_aborted));
+        }
+        co_return std::move(*msg);
     }
-    co_return std::move(*msg);
-}
+#ifdef HAJIMI_QUIC
+    else if (auto transport = std::get_if<HajimiTransportQuic>(d.get())) { // QUIC
+        // Read the header first
+        // u16 len
+        // u8 type
+        std::array<std::byte, HAJIMI_HEADER> header;
+        ILIAS_CO_TRYV(co_await transport->control.readAll(header));
+        auto len = std::to_integer<std::uint16_t>(header[0]) << 8 | std::to_integer<std::uint16_t>(header[1]);
+        auto type = std::to_integer<std::uint8_t>(header[2]);
 
-auto HajimiConnection::writeMessage(ControlMessage msg) -> IoTask<void> {
-    auto conn = d;
-    if (auto transport = std::get_if<HajimiTransportStream>(conn.get())) { // Stream
-        co_return transport->postMessage(0, msg.toMessage());
+        // Read the body
+        if (transport->readBuffer.capacity() < len + HAJIMI_HEADER_ROOM) {
+            transport->readBuffer = transport->pool.allocate(len + HAJIMI_HEADER_ROOM);
+        }
+        transport->readBuffer.clear();
+        transport->readBuffer.reserveHead(HAJIMI_HEADER_ROOM);
+
+        auto space = transport->readBuffer.prepareBack(len);
+        ILIAS_CO_TRYV(co_await transport->control.readAll(space));
+        transport->readBuffer.commitBack(len);
+
+        // Parse it
+        auto msg = parseMessage(type, transport->readBuffer);
+        if (!msg) {
+            co_return Err(std::make_error_code(std::errc::bad_message));
+        }
+
+        // Check is control
+        auto control = ControlMessage::fromMessage(std::move(*msg));
+        if (!control) {
+            co_return Err(std::make_error_code(std::errc::bad_message));
+        }
+        co_return std::move(*control);
     }
+#endif // HAJIMI_QUIC
     else {
         co_return Err(std::make_error_code(std::errc::invalid_argument));
     }
 }
 
-auto HajimiConnection::acceptTunnel() -> IoTask<std::pair<OpenTunnel, HajimiStream>> {
-    auto &transport = std::get<HajimiTransportStream>(*d);
-    auto tun = co_await transport.tunnelPendingReceiver.recv();
-    if (!tun) {
-        co_return Err(std::make_error_code(std::errc::connection_aborted));
+auto HajimiConnection::writeMessage(ControlMessage msg) -> IoTask<void> {
+    if (auto transport = std::get_if<HajimiTransportStream>(d.get())) { // Stream
+        co_return transport->postMessage(0, msg.toMessage());
     }
-    // Build it
-    HajimiStream stream;
-    stream.mConn = d;
-    stream.d = std::make_unique<HajimiStream::Impl>(std::move(tun->tunnel));
-    co_return std::pair {
-        std::move(tun->request),
-        std::move(stream)
-    };
+#ifdef HAJIMI_QUIC
+    else if (auto transport = std::get_if<HajimiTransportQuic>(d.get())) { // QUIC
+        auto lock = co_await transport->writeMutex.lock();
+        auto &buf = transport->writer.writeMessage(msg.toMessage());
+
+        ILIAS_CO_TRYV(co_await transport->control.writeAll(buf.data()));
+        ILIAS_CO_TRYV(co_await transport->control.flush());
+        co_return {};
+    }
+#endif
+    else {
+        co_return Err(std::make_error_code(std::errc::invalid_argument));
+    }
+}
+
+auto HajimiConnection::acceptTunnel() -> IoTask<std::pair<OpenTunnel, HajimiStream> > {
+    if (auto transport = std::get_if<HajimiTransportStream>(d.get())) { // Stream
+        auto tun = co_await transport->tunnelPendingReceiver.recv();
+        if (!tun) {
+            co_return Err(std::make_error_code(std::errc::connection_aborted));
+        }
+        // Build it
+        HajimiStream stream;
+        stream.mConn = d;
+        stream.d = std::make_unique<HajimiStream::Impl>(std::move(tun->tunnel));
+        co_return std::pair {
+            std::move(tun->request),
+            std::move(stream)
+        };
+    }
+#ifdef HAJIMI_QUIC
+    else if (auto transport = std::get_if<HajimiTransportQuic>(d.get())) { // QUIC
+        ILIAS_CO_TRY(auto qstream, co_await transport->conn.acceptStream());
+
+        // Read the OpenTunnel request
+        // u16 len
+        // u8 type
+        std::array<std::byte, HAJIMI_HEADER> header;
+        ILIAS_CO_TRYV(co_await qstream.readAll(header));
+        auto len = std::to_integer<std::uint16_t>(header[0]) << 8 | std::to_integer<std::uint16_t>(header[1]);
+        auto type = std::to_integer<std::uint8_t>(header[2]);
+
+        // Read the body
+        auto buf = transport->pool.allocate(len);
+        auto space = buf.prepareBack(len);
+        ILIAS_CO_TRYV(co_await qstream.readAll(space));
+        buf.commitBack(len);
+
+        // Parse it
+        auto msg = parseMessage(type, buf);
+        if (!msg || msg->type() != MessageType::OpenTunnel) {
+            co_return Err(std::make_error_code(std::errc::bad_message));
+        }
+        ILIAS_CO_TRY(auto open, msg->cast<OpenTunnel>());
+
+        // Build it
+        HajimiStream stream;
+        stream.mConn = d;
+        stream.d = std::make_unique<HajimiStream::Impl>(std::move(qstream));
+        co_return std::pair {
+            std::move(open),
+            std::move(stream),
+        };
+    }
+#endif // HAJIMI_QUIC
+    else {
+        co_return Err(std::make_error_code(std::errc::invalid_argument));
+    }
 }
 
 auto HajimiConnection::openTunnel(OpenTunnel open) -> IoTask<HajimiStream> {
-    auto conn = d;
-    auto &transport = std::get<HajimiTransportStream>(*conn);
+    if (auto transport = std::get_if<HajimiTransportStream>(d.get())) { // Stream
+        // Check precond
+        if (transport->error) co_return Err(transport->error);
+        if (open.addr.size() > HAJIMI_MAX_DATA_EXCHANGE - sizeof(open.port)) {
+            co_return Err(std::make_error_code(std::errc::message_size));
+        }
+        if (transport->tunnels.size() >= MAX_TUNNELS) {
+            co_return Err(std::make_error_code(std::errc::no_buffer_space));
+        }
+        if (transport->nextId >= UINT64_MAX - 1) {
+            co_return Err(std::make_error_code(std::errc::value_too_large));
+        }
 
-    // Check precond
-    if (transport.error) co_return Err(transport.error);
-    if (open.addr.size() > HAJIMI_MAX_DATA_EXCHANGE - sizeof(open.port)) {
-        co_return Err(std::make_error_code(std::errc::message_size));
-    }
-    if (transport.tunnels.size() >= MAX_TUNNELS) {
-        co_return Err(std::make_error_code(std::errc::no_buffer_space));
-    }
-    if (transport.nextId >= UINT64_MAX - 1) {
-        co_return Err(std::make_error_code(std::errc::value_too_large));
-    }
+        // Register it
+        auto tunnel = std::make_shared<HajimiTunnel>(transport->nextId);
+        transport->nextId += 2;
+        transport->tunnels.emplace(tunnel->id, tunnel);
 
-    // Register it
-    auto tunnel = std::make_shared<HajimiTunnel>(transport.nextId);
-    transport.nextId += 2;
-    transport.tunnels.emplace(tunnel->id, tunnel);
+        // Local handle resets the tunnel if opening fails or is cancelled.
+        HajimiStream stream;
+        stream.mConn = d;
+        stream.d = std::make_unique<HajimiStream::Impl>(tunnel);
+        // Queue Open synchronously so concurrent opens preserve stream ID order.
+        ILIAS_CO_TRYV(transport->postMessage(tunnel->id, std::move(open)));
+        co_return stream;
+    }
+#ifdef HAJIMI_QUIC
+    else if (auto transport = std::get_if<HajimiTransportQuic>(d.get())) { // QUIC
+        ILIAS_CO_TRY(auto qstream, co_await transport->conn.openStream());
+        MessageWriter writer{transport->pool};
+        auto &buf = writer.writeMessage(Message{open});
+        ILIAS_CO_TRYV(co_await qstream.writeAll(buf.data()));
+        ILIAS_CO_TRYV(co_await qstream.flush());
 
-    // Local handle resets the tunnel if opening fails or is cancelled.
-    HajimiStream stream;
-    stream.mConn = conn;
-    stream.d = std::make_unique<HajimiStream::Impl>(tunnel);
-    // Queue Open synchronously so concurrent opens preserve stream ID order.
-    ILIAS_CO_TRYV(transport.postMessage(tunnel->id, std::move(open)));
-    co_return stream;
+        // Build it
+        HajimiStream stream;
+        stream.mConn = d;
+        stream.d = std::make_unique<HajimiStream::Impl>(std::move(qstream));
+        co_return stream;
+    }
+#endif // HAJIMI_QUIC 
+    else {
+        co_return Err(std::make_error_code(std::errc::invalid_argument));
+    }
 }
 
 auto HajimiConnection::run() -> IoTask<void> {
     auto conn = d;
+#ifdef HAJIMI_QUIC
+    if (std::holds_alternative<HajimiTransportQuic>(*conn)) {
+        // Waiting for cancel, we don't need mutiplex, it was handled by quic
+        co_await ilias::this_coro::suspendForever();
+    }
+#endif // HAJIMI_QUIC
     auto &transport = std::get<HajimiTransportStream>(*conn);
 
     // Start loop
@@ -433,94 +586,156 @@ auto HajimiConnection::run() -> IoTask<void> {
 }
 
 auto HajimiConnection::status() const -> Status {
-    return std::get<HajimiTransportStream>(*d).status;
+    return std::visit([](const auto &transport) { return transport.status; }, *d);
 }
 
+// MARK: HajimiStream
 HajimiStream::HajimiStream() = default;
 HajimiStream::HajimiStream(HajimiStream &&) noexcept = default;
 HajimiStream::~HajimiStream() { reset(); }
 
 auto HajimiStream::reset() noexcept -> void {
     if (!d) return;
-    auto tunnel = std::get<HajimiTunnel::Ptr>(*d);
-    std::get<HajimiTransportStream>(*mConn).resetTunnel(tunnel);
+    if (auto transport = std::get_if<HajimiTransportStream>(mConn.get())) { // Stream
+        auto tunnel = std::get<HajimiTunnel::Ptr>(*d);
+        transport->resetTunnel(tunnel);
+    }
+#ifdef HAJIMI_QUIC // Quic
+    else if (auto stream = std::get_if<QuicStream>(d.get())) { // QUIC
+        stream->reset();
+    }
+#endif // HAJIMI_QUIC
 }
 
 auto HajimiStream::read() -> IoTask<SkBuffer> {
-    auto &transport = std::get<HajimiTransportStream>(*mConn);
-    auto tunnel = std::get<HajimiTunnel::Ptr>(*d);
+    if (auto transport = std::get_if<HajimiTransportStream>(mConn.get())) { // Stream
+        auto tunnel = std::get<HajimiTunnel::Ptr>(*d);
 
-    auto buf = co_await tunnel->bytesReceiver.recv();
-    if (!buf) co_return SkBuffer{}; // FIN drains earlier data before EOF.
+        auto buf = co_await tunnel->bytesReceiver.recv();
+        if (!buf) co_return SkBuffer{}; // FIN drains earlier data before EOF.
 
-    // Return the credit back to the peer sender
-    if (!tunnel->readFin) {
-        auto size = static_cast<uint32_t>(buf->size());
-        ILIAS_CO_TRYV(transport.postMessage(tunnel->id, WindowUpdate{size}));
-        tunnel->recvWindow += size;
+        // Return the credit back to the peer sender
+        if (!tunnel->readFin) {
+            auto size = static_cast<uint32_t>(buf->size());
+            ILIAS_CO_TRYV(transport->postMessage(tunnel->id, WindowUpdate{ .size = size }));
+            tunnel->recvWindow += size;
+        }
+        transport->status.bytesReceived += buf->size();
+        co_return std::move(*buf);
     }
-    transport.status.bytesReceived += buf->size();
-    co_return std::move(*buf);
+#ifdef HAJIMI_QUIC
+    if (auto transport = std::get_if<HajimiTransportQuic>(mConn.get())) { // QUIC
+        // TODO: Add a fast path to get inner skbuf directly from quic stream?
+        auto &stream = std::get<QuicStream>(*d);
+        auto buf = transport->pool.allocate(HAJIMI_MAX_DATA_EXCHANGE + HAJIMI_HEADER_ROOM);
+        buf.reserveHead(HAJIMI_HEADER_ROOM);
+
+        auto space = buf.prepareBack(HAJIMI_MAX_DATA_EXCHANGE);
+        ILIAS_CO_TRY(auto n, co_await stream.read(space));
+        if (n == 0) co_return SkBuffer{};
+
+        // Update status
+        transport->status.bytesReceived += n;
+        buf.commitBack(n);
+        co_return buf;
+    }
+#endif // HAJIMI_QUIC
+    else {
+        // Should not happened
+        co_return Err(std::make_error_code(std::errc::invalid_argument));
+    }
 }
 
 auto HajimiStream::write(SkBuffer buf) -> IoTask<size_t> {
     if (buf.empty()) co_return 0;
 
-    auto &transport = std::get<HajimiTransportStream>(*mConn);
-    auto tunnel = std::get<HajimiTunnel::Ptr>(*d);
-    auto bufSize = buf.size();
+    if (auto transport = std::get_if<HajimiTransportStream>(mConn.get())) { // Stream
+        auto tunnel = std::get<HajimiTunnel::Ptr>(*d);
+        auto bufSize = buf.size();
 
-    // If cancel or failed, reset the stream
-    ScopeExit cleanup{[&]() { 
-        transport.resetTunnel(tunnel); 
-    }};
-    while (!buf.empty()) {
-        // Waiting for the send window to updated
-        while (tunnel->sendWindow == 0 && !tunnel->error && !tunnel->writeFin) {
-            co_await tunnel->sendWindowUpdated.wait();
-        }
-        if (tunnel->error) co_return Err(tunnel->error);
-        if (tunnel->writeFin) co_return 0;
+        // If cancel or failed, reset the stream
+        ScopeExit cleanup{[&]() { 
+            transport->resetTunnel(tunnel); 
+        }};
+        while (!buf.empty()) {
+            // Waiting for the send window to updated
+            while (tunnel->sendWindow == 0 && !tunnel->error && !tunnel->writeFin) {
+                co_await tunnel->sendWindowUpdated.wait();
+            }
+            if (tunnel->error) co_return Err(tunnel->error);
+            if (tunnel->writeFin) co_return 0;
 
-        auto size = std::min({buf.size(), tunnel->sendWindow, std::size_t{HAJIMI_MAX_DATA_EXCHANGE}});
+            auto size = std::min({buf.size(), tunnel->sendWindow, std::size_t{HAJIMI_MAX_DATA_EXCHANGE}});
 
-        SkBuffer part;
-        if (size == buf.size() && buf.unique() && buf.headroom() >= HAJIMI_HEADER_ROOM) {
-            part = std::exchange(buf, SkBuffer{}); // Fast path: prepend the frame header without copying.
+            SkBuffer part;
+            if (size == buf.size() && buf.unique() && buf.headroom() >= HAJIMI_HEADER_ROOM) {
+                part = std::exchange(buf, SkBuffer{}); // Fast path: prepend the frame header without copying.
+            }
+            else { // Copy :(
+                part = transport->pool.allocate(HAJIMI_HEADER_ROOM + size);
+                part.reserveHead(HAJIMI_HEADER_ROOM);
+                part.append(buf.data().first(size));
+                buf.consumeFront(size);
+            }
+            auto _ = transport->postMessage(tunnel->id, DataExchange {
+                .data = std::move(part)
+            });
+            tunnel->sendWindow -= size;
         }
-        else { // Copy :(
-            part = transport.pool.allocate(HAJIMI_HEADER_ROOM + size);
-            part.reserveHead(HAJIMI_HEADER_ROOM);
-            part.append(buf.data().first(size));
-            buf.consumeFront(size);
-        }
-        auto _ = transport.postMessage(tunnel->id, DataExchange {
-            .data = std::move(part)
-        });
-        tunnel->sendWindow -= size;
+        cleanup.disarm();
+
+        // Update the status
+        transport->status.bytesSent += bufSize;
+        co_return bufSize;
     }
-    cleanup.disarm();
-
-    // Update the status
-    transport.status.bytesSent += bufSize;
-    co_return bufSize;
+#ifdef HAJIMI_QUIC
+    if (auto transport = std::get_if<HajimiTransportQuic>(mConn.get())) { // QUIC
+        auto &stream = std::get<QuicStream>(*d);
+        auto n = co_await stream.writeAll(buf.data());
+        if (n) {
+            transport->status.bytesSent += *n;
+        }
+        co_return n;
+    }
+#endif // HAJIMI_QUIC
+    else {
+        co_return Err(std::make_error_code(std::errc::invalid_argument));
+    }
 }
 
 auto HajimiStream::shutdown() -> IoTask<void> {
-    auto conn = mConn;
-    auto &transport = std::get<HajimiTransportStream>(*mConn);
-    auto tunnel = std::get<HajimiTunnel::Ptr>(*d);
+    if (auto transport = std::get_if<HajimiTransportStream>(mConn.get())) { // Stream
+        auto tunnel = std::get<HajimiTunnel::Ptr>(*d);
 
-    if (tunnel->error) co_return Err(tunnel->error);
-    if (tunnel->writeFin) co_return {}; // Already shutdown
-    
-    auto _ = transport.postMessage(tunnel->id, TunnelShutdown{});
-    co_return {};
+        if (tunnel->error) co_return Err(tunnel->error);
+        if (tunnel->writeFin) co_return {}; // Already shutdown
+        
+        auto _ = transport->postMessage(tunnel->id, TunnelShutdown{});
+        co_return {};        
+    }
+#ifdef HAJIMI_QUIC
+    if (auto transport = std::get_if<HajimiTransportQuic>(mConn.get())) { // QUIC
+        auto &stream = std::get<QuicStream>(*d);
+        co_return co_await stream.shutdown();
+    }
+#endif // HAJIMI_QUIC
+    else {
+        co_return Err(std::make_error_code(std::errc::invalid_argument));
+    }
 }
 
 auto HajimiStream::pool() const -> SkBufferPool & {
-    assert(mConn);
-    return std::get<HajimiTransportStream>(*mConn).pool;
+    if (auto transport = std::get_if<HajimiTransportStream>(mConn.get())) { // Stream
+        return transport->pool;
+    }
+#ifdef HAJIMI_QUIC
+    if (auto transport = std::get_if<HajimiTransportQuic>(mConn.get())) { // QUIC
+        return transport->pool;
+    }
+#endif // HAJIMI_QUIC
+    else {
+        throw std::runtime_error{"Invalid transport type"};
+    }
 }
 
 // MARK: Over Stream
@@ -732,10 +947,3 @@ auto HajimiTransportStream::writeLoop() -> IoTask<void> {
     }
     co_return {};
 }
-
-// MARK: Tunnel
-// auto HajimiTransportStream::Tunnel::write(SkBuffer buf) -> IoTask<void> {
-    
-// }
-
-// MARK: Over Quic

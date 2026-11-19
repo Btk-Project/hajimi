@@ -92,7 +92,7 @@ public:
 
 
 // MARK: ProxyServer
-ProxyServer::ProxyServer(Config config) : mConfig(config) {
+ProxyServer::ProxyServer(Config config) : mConfig(config), mPool(HAJIMI_POOL_CONFIG, &mTracker) {
 
 }
 
@@ -153,8 +153,7 @@ auto ProxyServer::runTcp() -> IoTask<void> {
         std::println("[ProxyServer] New tcp connection from {}", addr);
 
         mScope->spawn([this, s = std::move(sock), addr]() mutable -> IoTask<void>{
-            SkBufferPool pool{HAJIMI_POOL_CONFIG, &mTracker};
-            ILIAS_CO_TRY(auto conn, co_await HajimiConnection::fromServer(pool, std::move(s)));
+            ILIAS_CO_TRY(auto conn, co_await HajimiConnection::fromServer(mPool, std::move(s)));
             co_return co_await handleSession(conn, addr, "TCP");
         });
     }
@@ -179,9 +178,10 @@ auto ProxyServer::runQuic() -> IoTask<void> {
         }
     ));
 
-    auto worker = [&](QuicConnection conn) -> IoTask<void> { // Take the lifetime of the connection
-        ILIAS_CO_TRY(auto stream, co_await conn.acceptStream());
-        co_return co_await handleSession(std::move(stream), conn.remoteEndpoint(), "QUIC");
+    auto worker = [&](QuicConnection qconn) -> IoTask<void> { // Take the lifetime of the connection
+        auto endpoint = qconn.remoteEndpoint();
+        ILIAS_CO_TRY(auto conn, co_await HajimiConnection::fromServer(mPool, std::move(qconn)));
+        co_return co_await handleSession(conn, endpoint, "QUIC");
     };
 
     TaskScope connections;

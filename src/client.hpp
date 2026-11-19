@@ -49,7 +49,7 @@ public:
 private:
     // Connect, register, dispatch messages until the connection breaks
     auto connectOnce(bool &registered, void *quicContext) -> IoTask<void>;
-    auto runOnce(bool &registered, HajimiConnection conn) -> IoTask<void>;
+    auto runOnce(bool &registered, HajimiConnection &conn) -> IoTask<void>;
     auto runImpl(bool &registered, HajimiConnection &conn) -> IoTask<void>;
     
     Config mConfig;

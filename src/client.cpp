@@ -115,12 +115,13 @@ auto ProxyClient::connectOnce(bool &registered, void *quicContext) -> IoTask<voi
         }
         auto ctxt = static_cast<QuicContext *>(quicContext);
         std::println("[ProxyClient] Connecting to master {} using QUIC...", mConfig.master);
-        auto conn = co_await ctxt->connect(mConfig.master);
-        if (!conn) { // Failed
-            lastErr = conn.error();
+        auto qconn = co_await ctxt->connect(mConfig.master);
+        if (!qconn) { // Failed
+            lastErr = qconn.error();
             break;
         }
-        co_return co_await runOnce(registered, *stream);
+        ILIAS_CO_TRY(auto conn, co_await HajimiConnection::fromClient(pool, std::move(*qconn)));
+        co_return co_await runOnce(registered, conn);
     }
     while (false);
     if (mConfig.transport == "quic") { // Didn't allow fallback
@@ -135,10 +136,10 @@ auto ProxyClient::connectOnce(bool &registered, void *quicContext) -> IoTask<voi
     auto _ = stream.setOption(ilias::sockopt::TcpNoDelay{true}); // Disable Nagle algorithm
     
     ILIAS_CO_TRY(auto conn, co_await HajimiConnection::fromClient(pool, std::move(stream)));
-    co_return co_await runOnce(registered, std::move(conn));
+    co_return co_await runOnce(registered, conn);
 }
 
-auto ProxyClient::runOnce(bool &registered, HajimiConnection conn) -> IoTask<void> {
+auto ProxyClient::runOnce(bool &registered, HajimiConnection &conn) -> IoTask<void> {
     auto [a, b] = co_await ilias::whenAny(
         runImpl(registered, conn),
         conn.run() // Drive the connection

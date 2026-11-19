@@ -10,6 +10,7 @@
 #include "../src/quic/test_hooks.hpp"
 #include "../src/utils/scope_exit.hpp"
 #include "../src/server.hpp"
+#include "../src/transport.hpp"
 
 using namespace std::literals;
 using ilias::Err;
@@ -121,6 +122,35 @@ ILIAS_TEST(Quic, DuplexAndFin) {
         ILIAS_CO_TRYV(co_await dynamic.readAll(ilias::makeBuffer(buffer)));
         ILIAS_CO_TRY(eof, co_await dynamic.read(ilias::makeBuffer(buffer)));
         EXPECT_EQ(eof, 0);
+        co_return {};
+    });
+    EXPECT_TRUE(result) << result.error().message();
+    co_return;
+}
+
+ILIAS_TEST(Quic, HajimiFrameLengthsAndStatus) {
+    auto result = co_await withConnections([](QuicConnection &local, QuicConnection &peer) -> IoTask<void> {
+        SkBufferPool pool{HAJIMI_POOL_CONFIG};
+        ILIAS_CO_TRY(auto client, co_await HajimiConnection::fromClient(pool, std::move(local)));
+        auto name = std::string(300, 'n');
+        ILIAS_CO_TRYV(co_await client.writeMessage(Hello{HAJIMI_VERSION, name}));
+        ILIAS_CO_TRY(auto server, co_await HajimiConnection::fromServer(pool, std::move(peer)));
+        ILIAS_CO_TRY(auto message, co_await server.readMessage());
+        ILIAS_CO_TRY(auto hello, message.cast<Hello>());
+        EXPECT_EQ(hello.name, name);
+
+        auto address = std::string(300, 'a');
+        ILIAS_CO_TRY(auto outbound, co_await client.openTunnel(OpenTunnel{address, 65535}));
+        ILIAS_CO_TRY(auto inbound, co_await server.acceptTunnel());
+        EXPECT_EQ(inbound.first.addr, address);
+        EXPECT_EQ(inbound.first.port, 65535);
+
+        auto payload = "data"sv;
+        ILIAS_CO_TRYV(co_await outbound.write(SkBuffer{ilias::makeBuffer(payload), pool}));
+        ILIAS_CO_TRY(auto received, co_await inbound.second.read());
+        EXPECT_TRUE(std::ranges::equal(received.data(), ilias::makeBuffer(payload)));
+        EXPECT_EQ(client.status().bytesSent, payload.size());
+        EXPECT_EQ(server.status().bytesReceived, payload.size());
         co_return {};
     });
     EXPECT_TRUE(result) << result.error().message();

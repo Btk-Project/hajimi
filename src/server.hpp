@@ -13,6 +13,7 @@
 #include "utils/allocator.hpp"
 #include "transport.hpp"
 #include "duckdns.hpp"
+#include "skbuf.hpp"
 
 // Import
 using ilias::IPEndpoint;
@@ -101,6 +102,7 @@ private:
 
     Config mConfig;
     AllocationTracker mTracker;
+    SkBufferPool      mPool;
     ilias::TaskScope *mScope = nullptr;
     std::optional<DuckDnsUpdater> mDuckDns; // DuckDns updater, nullopt if ddns is disabled
     std::chrono::steady_clock::time_point mStartTime; // timestamp of inited
