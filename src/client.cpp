@@ -10,6 +10,7 @@
 #include <map>
 
 #include "utils/scope_exit.hpp"
+#include "utils/color.hpp"
 #include "utils/he2.hpp"
 #include "transport.hpp"
 #include "protocol.hpp"
@@ -168,8 +169,8 @@ auto ProxyClient::runImpl(bool &registered, HajimiConnection &conn) -> IoTask<vo
         co_return {};
     }
     registered = true;
-    std::println("[ProxyClient] Registered as '{}'", mConfig.name);
-
+    std::println("[ProxyClient] {} as '{}'", styled("Registered", Color::Green), mConfig.name);
+    
     // Begin the loop
     // Prepare channel
     TaskScope scope;
@@ -188,7 +189,8 @@ auto ProxyClient::runImpl(bool &registered, HajimiConnection &conn) -> IoTask<vo
         );
         for (const auto res : {read, accept, forward, ping}) {
             if (res && !res->has_value()) {
-                std::println("[ProxyClient] Session ended: {}", res->error().message());
+                std::println("[ProxyClient] Session {}: {}", styled("ended", Color::Red), res->error().message());
+                break;
             }
         }
         scope.stop();

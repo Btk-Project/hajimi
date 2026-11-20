@@ -492,6 +492,12 @@ auto ClientSession::rateWorker() -> IoTask<void> {
 
 auto ClientSession::openTunnel(ProxyStatus::Ptr status, DynStream local, std::string host, uint16_t port) -> void {
     mScope.spawn([this, status, local = std::move(local), host, port]() mutable -> IoTask<void> {
+        status->totalConnections += 1;
+        status->activeConnections += 1;
+        ScopeExit exit{[&]() {
+            status->activeConnections -= 1;
+        }};
+
         std::println("[ClientSession] {} request to open tunnel to {}:{}", mName, host, port);
         ILIAS_CO_TRY(auto peer, co_await mConn.openTunnel(OpenTunnel {
             .addr = host,
