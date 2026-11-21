@@ -40,7 +40,7 @@ enum class QuicError {
 auto make_error_code(QuicError error) noexcept -> std::error_code;
 
 /**
- * @brief Own one UDP endpoint and drive its QUIC v1 connections.
+ * @brief Own a UDP endpoint and drive its QUIC connections.
  * @note The context, connections and streams must use the same ilias executor;
  *       these handles are not thread-safe. Keep handles alive during their operations.
  * @note Run run() concurrently with application tasks. Stop and await it before
@@ -55,10 +55,18 @@ public:
         Server, ///< Accept connections with accept().
     };
 
+    /// @brief Select the QUIC wire versions supported by this endpoint.
+    enum class VersionPolicy {
+        PreferV2, ///< Support both versions and prefer QUIC v2.
+        V1Only,   ///< Use only QUIC v1.
+        V2Only,   ///< Use only QUIC v2.
+    };
+
     /**
      * @brief Cumulative UDP I/O counters and currently enabled capabilities.
      * @note Submissions count API operations, not measured system calls.
      *       Datagram counts refer to the original UDP boundaries, before coalescing.
+     *       Counters include migration sockets; capability flags describe the bound socket.
      */
     struct IoStats {
         uint64_t txDatagrams = 0;          ///< Successfully sent datagrams.
@@ -109,7 +117,11 @@ public:
         std::chrono::milliseconds handshakeTimeout{10000};
 
         /// @brief Local idle timeout; the effective timeout also depends on the peer.
-        std::chrono::milliseconds idleTimeout{30000};
+        std::chrono::milliseconds idleTimeout{90000};
+
+        /// @brief Idle interval before sending a QUIC PING; zero disables keep-alive.
+        /// @note Capped at half the effective idle timeout.
+        std::chrono::milliseconds keepAliveInterval{25000};
 
         /// @brief Maximum retained connections, including handshakes and closing peers.
         size_t maxConnections = 128;
@@ -144,6 +156,9 @@ public:
         /// @note Must outlive the context and all its connections and streams.
         ///       It does not control TLS, ngtcp2 or other container allocations.
         std::pmr::memory_resource *memoryResource = std::pmr::get_default_resource();
+
+        /// @brief Supported QUIC versions and negotiation preference.
+        VersionPolicy versions = VersionPolicy::PreferV2;
     };
 
     /// @brief Context ownership cannot be copied.
@@ -171,8 +186,8 @@ public:
      * @brief Drive packet I/O, timers and connection handshakes until stopped.
      * @pre This context has not been stopped and no other run() is active.
      * @return Success on stop(), or an I/O error from a worker.
-     * @note Recoverable UDP errors retry with backoff on the same socket. An encoded
-     *       send batch is retained until sent or its connection retry timeout expires.
+     * @note Recoverable UDP errors retry with backoff on the original path.
+     *       During migration ngtcp2 can recover failed sends on another path.
      * @note Stop and cancellation attempt CONNECTION_CLOSE for all active peers
      *       before closing UDP. Cleanup has a total 250 ms budget and ignores
      *       cancellation; it does not wait for peer acknowledgements.
@@ -266,6 +281,16 @@ public:
     auto acceptStream() -> IoTask<QuicStream>;
 
     /**
+     * @brief Migrate a client connection to a new local UDP endpoint.
+     * @param local Local address to bind; port zero selects an ephemeral port.
+     * @return Success when the new path is usable, or a bind or validation error.
+     * @note Existing streams continue on the same connection. The peer must allow
+     *       active migration. Only one migration can run at a time. Cancellation
+     *       stops waiting; validation continues.
+     */
+    auto migrate(IPEndpoint local) -> IoTask<void>;
+
+    /**
      * @brief Request application closure and wait for CONNECTION_CLOSE transmission.
      * @param appError QUIC application error in [0, 2^62 - 1]; zero means no error.
      * @note Pending stream operations fail immediately. This does not flush stream
@@ -273,8 +298,14 @@ public:
      */
     auto close(uint64_t appError = 0) -> IoTask<void>;
 
-    /// @brief Return the fixed peer address, or an empty endpoint for an empty handle.
+    /// @brief Return the local endpoint of the current path, or an empty endpoint.
+    auto localEndpoint() const -> IPEndpoint;
+
+    /// @brief Return the peer endpoint of the current path, or an empty endpoint.
     auto remoteEndpoint() const -> IPEndpoint;
+
+    /// @brief Return the negotiated QUIC wire version, or zero for an empty handle.
+    auto version() const noexcept -> uint32_t;
 
     /// @brief Return the recorded local/remote application close code, if any.
     auto appError() const noexcept -> std::optional<uint64_t>;
@@ -327,6 +358,8 @@ public:
     /**
      * @brief Wait until all accepted bytes complete their first UDP transmission.
      * @note Does not wait for an ACK or application receipt, and does not send FIN.
+     *       If a path change forces retransmission of an unsent batch, completion
+     *       of those bytes is confirmed by an ACK.
      */
     auto flush() -> IoTask<void>;
 

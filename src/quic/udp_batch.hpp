@@ -38,7 +38,8 @@ public:
     };
 
     /// @brief Register a bound socket and allocate reusable receive slots from pool.
-    static auto from(ilias::Socket socket, SkBufferPool &pool, bool batching) -> IoResult<UdpBatchSocket>;
+    static auto from(ilias::Socket socket, SkBufferPool &pool, bool batching,
+        std::shared_ptr<QuicContext::IoStats> stats = {}) -> IoResult<UdpBatchSocket>;
 
     auto send(ilias::Buffer data, const IPEndpoint &remote, size_t segmentSize,
         unsigned int ecn = 0) -> Task<Sent>;
@@ -48,7 +49,12 @@ public:
 
     auto localEndpoint() const { return mSocket.localEndpoint(); }
     auto close() -> void { mSocket.close(); }
-    auto stats() const noexcept -> QuicContext::IoStats { return mStats; }
+    auto stats() const noexcept -> QuicContext::IoStats {
+        auto stats = mStats ? *mStats : QuicContext::IoStats{};
+        stats.sendSegmentation = mSendSegmentation;
+        stats.receiveCoalescing = mReceiveCoalescing;
+        return stats;
+    }
 #ifdef HAJIMI_QUIC_TESTING
     // A null endpoint denotes receive; completed is the successful send prefix.
     using FaultInjector = std::function<std::error_code(const IPEndpoint *, size_t completed)>;
@@ -66,7 +72,9 @@ private:
     ilias::CmsgSpace mSendControl;
     std::vector<ReceiveSlot> mReceive;
     std::array<Received, receiveSlots> mReceived;
-    QuicContext::IoStats mStats;
+    std::shared_ptr<QuicContext::IoStats> mStats;
+    bool mSendSegmentation = false;
+    bool mReceiveCoalescing = false;
     bool mBatching = false;
 #ifdef HAJIMI_QUIC_TESTING
     FaultInjector mFault;

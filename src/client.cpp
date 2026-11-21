@@ -224,8 +224,7 @@ auto ClientState::readWorker() -> IoTask<void> {
 auto ClientState::pingWorker() -> IoTask<void> {
     using namespace std::chrono_literals;
     while (true) {
-        // Stay below QUIC's 30s idle timeout, including with older servers.
-        co_await ilias::sleep(10s);
+        co_await ilias::sleep(30s);
         if (!co_await mConn.writeMessage(Ping {})) {
             co_return {};
         }

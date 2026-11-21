@@ -1,9 +1,8 @@
 # Async QUIC wrapper
 
 The wrapper uses ilias, ngtcp2 1.25.0 and OpenSSL 3.5+ with
-`ngtcp2_crypto_ossl`. It provides QUIC v1 bidirectional byte streams.
-It currently uses fixed peer addresses, with no migration, 0-RTT, HTTP/3,
-or unreliable DATAGRAM API.
+`ngtcp2_crypto_ossl`. It provides QUIC v1 and v2 bidirectional byte streams,
+client connection migration and transport keep-alive.
 
 Enable the optional build and its tests:
 
@@ -18,7 +17,7 @@ dependencies are not included. When enabled, the proxy defaults to TCP and QUIC
 on the server and QUIC-first connections on the client. See the root README for
 `--transport` and `--quic-psk-file`.
 
-`QuicContext` owns one UDP socket and drives all its connections in `run()`.
+`QuicContext` owns the initial UDP socket and drives all its connections in `run()`.
 Use each context and its handles on the same ilias executor. The context can
 connect to multiple peers or accept multiple connections, according to its role.
 Both `connect()` and `accept()` return after the TLS handshake completes.
@@ -34,6 +33,29 @@ available when the caller already has a specific address.
 The client verifies the certificate chain and the supplied DNS name or IP address
 by default. Set `caFile` for a private CA; the server requires `certFile` and
 `keyFile` in certificate mode. Both sides must use the same ALPN.
+
+The default `Config::versions` policy supports both versions and prefers v2.
+The client starts with a v1 Initial so v1 peers can respond. A dual-version
+server selects v2 during the same handshake. If a server offers only v2 in a
+Version Negotiation packet, the client retries once with v2.
+Set `VersionPolicy::V1Only` or `VersionPolicy::V2Only` to restrict the endpoint
+to one version. `QuicConnection::version()` reports the negotiated wire value.
+
+A client can call `co_await connection.migrate(newLocalEndpoint)` to bind a new
+local address or port and validate the new path before switching. Port zero
+selects an ephemeral port. The connection and its streams keep their state.
+The server also accepts peer address changes caused by NAT rebinding.
+`QuicConnection::localEndpoint()` and `remoteEndpoint()` report the current
+path. `QuicContext::localEndpoint()` reports the initial socket binding.
+
+`Config::idleTimeout` defaults to 90 seconds. The effective timeout uses the
+shorter nonzero value advertised by the two peers. `Config::keepAliveInterval`
+defaults to 25 seconds and is capped at half that timeout. After the interval
+elapses without QUIC traffic, ngtcp2 sends an ack-eliciting PING. Set the interval
+to zero to disable QUIC keep-alive on that endpoint.
+
+Hajimi sessions use a 30-second application heartbeat interval. The server
+waits up to 90 seconds for a Pong before ending the session.
 
 For certificate-free TLS 1.3 external PSK authentication, set `Config::psk` to
 the same 32 random bytes on both peers. `pskIdentity` must also match (default

@@ -102,6 +102,59 @@ auto withConnections(Fn fn, QuicContext::Config server = serverConfig(),
 
 } // namespace
 
+ILIAS_TEST(Quic, VersionNegotiation) {
+    using Policy = QuicContext::VersionPolicy;
+    struct Case {
+        Policy server;
+        Policy client;
+        uint32_t version;
+    };
+    constexpr uint32_t v1 = 0x00000001;
+    constexpr uint32_t v2 = 0x6b3343cf;
+    for (auto scenario : {
+        Case{Policy::PreferV2, Policy::PreferV2, v2},
+        Case{Policy::V1Only, Policy::PreferV2, v1},
+        Case{Policy::PreferV2, Policy::V1Only, v1},
+        Case{Policy::PreferV2, Policy::V2Only, v2},
+        Case{Policy::V2Only, Policy::PreferV2, v2},
+    }) {
+        auto server = serverConfig();
+        auto client = clientConfig();
+        server.versions = scenario.server;
+        client.versions = scenario.client;
+        client.maxConnections = 1;
+        auto result = co_await withConnections(
+            [version = scenario.version](QuicConnection &local, QuicConnection &peer) -> IoTask<void> {
+                EXPECT_EQ(local.version(), version);
+                EXPECT_EQ(peer.version(), version);
+                auto serve = [&]() -> IoTask<void> {
+                    ILIAS_CO_TRY(auto stream, co_await peer.acceptStream());
+                    co_return co_await echo(std::move(stream));
+                };
+                auto [sent, received] = co_await ilias::whenAll(exchange(local, 128, 'v'), serve());
+                ILIAS_CO_TRYV(std::move(sent));
+                co_return std::move(received);
+            }, server, client);
+        EXPECT_TRUE(result) << result.error().message();
+    }
+}
+
+ILIAS_TEST(Quic, RejectsDisjointVersions) {
+    using Policy = QuicContext::VersionPolicy;
+    auto server = serverConfig();
+    auto client = clientConfig();
+    server.versions = Policy::V2Only;
+    client.versions = Policy::V1Only;
+    auto result = co_await withContexts(server, client,
+        [](QuicContext &server, QuicContext &client) -> IoTask<void> {
+            auto connected = co_await client.connect(server.localEndpoint().value(), "localhost");
+            EXPECT_FALSE(connected);
+            if (!connected) EXPECT_NE(connected.error(), std::errc::timed_out);
+            co_return {};
+        });
+    EXPECT_TRUE(result) << result.error().message();
+}
+
 ILIAS_TEST(Quic, DuplexAndFin) {
     auto result = co_await withConnections([](QuicConnection &local, QuicConnection &peer) -> IoTask<void> {
         ILIAS_CO_TRY(auto stream, co_await local.openStream());
@@ -523,6 +576,7 @@ ILIAS_TEST(Quic, IdleTimeout) {
     auto server = serverConfig();
     auto client = clientConfig();
     server.idleTimeout = client.idleTimeout = 100ms;
+    server.keepAliveInterval = client.keepAliveInterval = 0ms;
     auto result = co_await withConnections([](QuicConnection &local, QuicConnection &) -> IoTask<void> {
         auto accepted = co_await local.acceptStream();
         EXPECT_FALSE(accepted);
@@ -531,6 +585,119 @@ ILIAS_TEST(Quic, IdleTimeout) {
     }, server, client);
     EXPECT_TRUE(result) << result.error().message();
     co_return;
+}
+
+ILIAS_TEST(Quic, KeepAliveSurvivesPeerIdleTimeout) {
+    auto server = serverConfig();
+    auto client = clientConfig();
+    server.idleTimeout = 200ms;
+    server.keepAliveInterval = 0ms;
+    client.keepAliveInterval = 2s;
+    auto result = co_await withConnections([](QuicConnection &local, QuicConnection &peer) -> IoTask<void> {
+        // Neither side opens a stream until well after the peer's idle timeout.
+        co_await ilias::sleep(750ms);
+        auto serve = [&]() -> IoTask<void> {
+            ILIAS_CO_TRY(auto stream, co_await peer.acceptStream());
+            co_return co_await echo(std::move(stream));
+        };
+        auto [sent, received] = co_await ilias::whenAll(exchange(local, 128, 'p'), serve());
+        ILIAS_CO_TRYV(std::move(sent));
+        co_return std::move(received);
+    }, server, client);
+    EXPECT_TRUE(result) << result.error().message();
+}
+
+ILIAS_TEST(Quic, MigrateLiveStream) {
+    for (auto bind : {IPEndpoint{"127.0.0.1:0"}, IPEndpoint{"[::1]:0"}}) {
+        auto config = clientConfig();
+        config.udpBatching = bind.family() == AF_INET;
+        auto result = co_await withContexts(serverConfig(), config,
+            [bind](QuicContext &server, QuicContext &client) -> IoTask<void> {
+                auto serverAddress = server.localEndpoint().value();
+                auto [connected, accepted] = co_await ilias::whenAll(
+                    client.connect(serverAddress, serverAddress.address().toString()), server.accept());
+                ILIAS_CO_TRY(auto local, std::move(connected));
+                ILIAS_CO_TRY(auto peer, std::move(accepted));
+                auto oldPath = local.localEndpoint();
+                EXPECT_EQ(oldPath, client.localEndpoint().value());
+                auto unsupported = co_await peer.migrate(bind);
+                EXPECT_FALSE(unsupported);
+                if (!unsupported) EXPECT_EQ(unsupported.error(), std::errc::operation_not_supported);
+
+                ILIAS_CO_TRY(auto stream, co_await local.openStream());
+                ILIAS_CO_TRYV(co_await stream.writeString("before"));
+                ILIAS_CO_TRY(auto incoming, co_await peer.acceptStream());
+                std::array<char, 6> data{};
+                ILIAS_CO_TRYV(co_await incoming.readAll(ilias::makeBuffer(data)));
+                EXPECT_EQ(std::string_view(data.data(), data.size()), "before");
+                EXPECT_EQ(peer.remoteEndpoint(), oldPath);
+
+                for (auto value : {"first!"sv, "second"sv}) {
+                    ILIAS_CO_TRYV(co_await local.migrate(bind));
+                    auto newPath = local.localEndpoint();
+                    EXPECT_NE(newPath, oldPath);
+                    EXPECT_EQ(local.remoteEndpoint(), serverAddress);
+                    ILIAS_CO_TRYV(co_await stream.writeString(value));
+                    ILIAS_CO_TRYV(co_await incoming.readAll(ilias::makeBuffer(data)));
+                    EXPECT_EQ(std::string_view(data.data(), data.size()), value);
+                    EXPECT_EQ(peer.remoteEndpoint(), newPath);
+                    oldPath = newPath;
+                }
+
+                auto original = client.localEndpoint().value();
+                ILIAS_CO_TRYV(co_await local.migrate(original));
+                EXPECT_EQ(local.localEndpoint(), original);
+                ILIAS_CO_TRYV(co_await stream.shutdown());
+                ILIAS_CO_TRY(auto eof, co_await incoming.read(ilias::makeBuffer(data)));
+                EXPECT_EQ(eof, 0);
+                EXPECT_EQ(peer.remoteEndpoint(), original);
+                ILIAS_CO_TRYV(co_await local.close(42));
+                auto closed = co_await peer.acceptStream();
+                EXPECT_FALSE(closed);
+                EXPECT_EQ(peer.appError(), 42);
+                co_return {};
+            }, bind);
+        EXPECT_TRUE(result) << result.error().message();
+    }
+}
+
+ILIAS_TEST(Quic, FailedMigrationKeepsOriginalPath) {
+    auto result = co_await withContexts(serverConfig(), clientConfig(),
+        [](QuicContext &server, QuicContext &client) -> IoTask<void> {
+            ILIAS_CO_TRY(auto relay, co_await ilias::UdpSocket::bind("127.0.0.1:0"));
+            auto serverAddress = server.localEndpoint().value();
+            auto clientAddress = client.localEndpoint().value();
+            auto forward = [&]() -> IoTask<void> {
+                std::array<std::byte, 2048> buffer;
+                while (true) {
+                    ILIAS_CO_TRY(auto packet, co_await relay.recvfrom(ilias::makeBuffer(buffer)));
+                    auto [size, from] = packet;
+                    if (from != serverAddress && from != clientAddress) continue;
+                    ILIAS_CO_TRYV(co_await relay.sendto(ilias::makeBuffer(buffer.data(), size),
+                        from == serverAddress ? clientAddress : serverAddress));
+                }
+            };
+            co_return co_await ilias::TaskScope::enter([&](ilias::TaskScope &scope) -> IoTask<void> {
+                scope.spawn(forward());
+                ScopeExit stopRelay{[&]() { scope.stop(); }};
+                auto [connected, accepted] = co_await ilias::whenAll(
+                    client.connect(relay.localEndpoint().value(), "localhost"), server.accept());
+                ILIAS_CO_TRY(auto local, std::move(connected));
+                ILIAS_CO_TRY(auto peer, std::move(accepted));
+                auto failed = co_await local.migrate("127.0.0.1:0");
+                EXPECT_FALSE(failed);
+                if (!failed) EXPECT_EQ(failed.error(), std::errc::host_unreachable);
+                EXPECT_EQ(local.localEndpoint(), clientAddress);
+                auto serve = [&]() -> IoTask<void> {
+                    ILIAS_CO_TRY(auto stream, co_await peer.acceptStream());
+                    co_return co_await echo(std::move(stream));
+                };
+                auto [sent, received] = co_await ilias::whenAll(exchange(local, 128, 'q'), serve());
+                ILIAS_CO_TRYV(std::move(sent));
+                co_return std::move(received);
+            });
+        });
+    EXPECT_TRUE(result) << result.error().message();
 }
 
 ILIAS_TEST(Quic, Ipv6) {
@@ -920,6 +1087,38 @@ ILIAS_TEST(Quic, HostnameConnectCancellation) {
 }
 
 #ifdef HAJIMI_QUIC_TESTING
+ILIAS_TEST(Quic, MigrationRecoversPendingDataAndFin) {
+    auto result = co_await withContexts(serverConfig(), clientConfig(),
+        [](QuicContext &server, QuicContext &client) -> IoTask<void> {
+            auto [connected, accepted] = co_await ilias::whenAll(
+                client.connect(server.localEndpoint().value(), "localhost"), server.accept());
+            ILIAS_CO_TRY(auto local, std::move(connected));
+            ILIAS_CO_TRY(auto peer, std::move(accepted));
+            size_t attempts = 0;
+            quic::ContextTestAccess::setFaultInjector(client, [&](auto remote, size_t) -> std::error_code {
+                if (!remote) return {};
+                ++attempts;
+                return ilias::SystemError::NetworkUnreachable;
+            });
+            ScopeExit resetFault{[&]() { quic::ContextTestAccess::setFaultInjector(client, {}); }};
+            ILIAS_CO_TRY(auto stream, co_await local.openStream());
+            ILIAS_CO_TRYV(co_await stream.writeString("pending"));
+            EXPECT_FALSE(co_await ilias::timeout(stream.shutdown(), 50ms));
+            EXPECT_GT(attempts, 0);
+            ILIAS_CO_TRYV(co_await local.migrate("127.0.0.1:0"));
+            ILIAS_CO_TRYV(co_await stream.flush());
+            ILIAS_CO_TRYV(co_await stream.shutdown());
+            ILIAS_CO_TRY(auto incoming, co_await peer.acceptStream());
+            std::array<char, 7> data{};
+            ILIAS_CO_TRYV(co_await incoming.readAll(ilias::makeBuffer(data)));
+            EXPECT_EQ(std::string_view(data.data(), data.size()), "pending");
+            ILIAS_CO_TRY(auto eof, co_await incoming.read(ilias::makeBuffer(data)));
+            EXPECT_EQ(eof, 0);
+            co_return {};
+        });
+    EXPECT_TRUE(result) << result.error().message();
+}
+
 ILIAS_TEST(Quic, ProxyServerExitsOnStoppedContext) {
     auto error = std::error_code(ilias::SystemError::BadFileDescriptor);
     quic::ContextTestAccess::setNextBindFault([=](auto remote, size_t) -> std::error_code {

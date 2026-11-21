@@ -94,20 +94,22 @@ auto receiveInfo(const MutableMsgHdr &msg, size_t size, size_t &segment, unsigne
 
 } // namespace
 
-auto UdpBatchSocket::from(ilias::Socket socket, SkBufferPool &pool, bool batching) -> IoResult<UdpBatchSocket> {
+auto UdpBatchSocket::from(ilias::Socket socket, SkBufferPool &pool, bool batching,
+    std::shared_ptr<QuicContext::IoStats> stats) -> IoResult<UdpBatchSocket> {
     UdpBatchSocket result;
     result.mBatching = batching;
+    result.mStats = stats ? std::move(stats) : std::make_shared<QuicContext::IoStats>();
     ILIAS_TRY(result.mSocket, ilias::UdpSocket::from(std::move(socket)));
     ILIAS_TRY(auto local, result.mSocket.localEndpoint());
     auto family = local.family();
     if (batching) {
 #if defined(_WIN32)
-        result.mStats.receiveCoalescing = bool(result.mSocket.setOption(sockopt::UdpRecvMaxCoalescedSize{65527}));
-        result.mStats.sendSegmentation = bool(result.mSocket.getOption<sockopt::UdpSendMsgSize>());
+        result.mReceiveCoalescing = bool(result.mSocket.setOption(sockopt::UdpRecvMaxCoalescedSize{65527}));
+        result.mSendSegmentation = bool(result.mSocket.getOption<sockopt::UdpSendMsgSize>());
 #elif defined(UDP_SEGMENT)
-        result.mStats.sendSegmentation = true; // Validate on the first real segmented submission.
+        result.mSendSegmentation = true; // Validate on the first real segmented submission.
 #ifdef UDP_GRO
-        result.mStats.receiveCoalescing = bool(result.mSocket.setOption(sockopt::UdpGro{1}));
+        result.mReceiveCoalescing = bool(result.mSocket.setOption(sockopt::UdpGro{1}));
 #endif
 #endif
     }
@@ -143,27 +145,27 @@ auto UdpBatchSocket::send(ilias::Buffer data, const IPEndpoint &remote,
     }
 #endif
 #if defined(_WIN32) || defined(UDP_SEGMENT)
-    if (count > 1 && mStats.sendSegmentation) {
+    if (count > 1 && mSendSegmentation) {
         CmsgWriter writer{mSendControl};
         writer.append(SendSegment{static_cast<uint16_t>(segmentSize)});
         appendEcn(writer, ipv6, ecn);
         IoVec vec{data};
         MsgHdr msg;
         msg.setEndpoint(remote).setBuffers(std::span{&vec, 1}).setControl(writer.end());
-        ++mStats.txSubmissions;
+        ++mStats->txSubmissions;
         auto sent = co_await mSocket.sendmsg(msg);
         if (sent) {
             if (*sent != data.size()) co_return Sent{0, std::make_error_code(std::errc::io_error)};
-            mStats.txDatagrams += count;
-            mStats.txBytes += data.size();
-            mStats.txSegmentedDatagrams += count;
-            mStats.maxTxBatch = std::max(mStats.maxTxBatch, count);
+            mStats->txDatagrams += count;
+            mStats->txBytes += data.size();
+            mStats->txSegmentedDatagrams += count;
+            mStats->maxTxBatch = std::max(mStats->maxTxBatch, count);
             co_return Sent{count};
         }
         if (!unsupported(sent.error())) co_return Sent{0, sent.error()};
         // The failed operation has completed; only now is splitting safe.
-        mStats.sendSegmentation = false;
-        ++mStats.segmentationFallbacks;
+        mSendSegmentation = false;
+        ++mStats->segmentationFallbacks;
     }
 #endif
     // Rebuild after a failed segmented send; all fallback messages share this ECN.
@@ -190,7 +192,7 @@ auto UdpBatchSocket::send(ilias::Buffer data, const IPEndpoint &remote,
                 if (auto error = mFault(&remote, completed)) co_return Sent{completed, error};
             }
 #endif
-            ++mStats.txSubmissions;
+            ++mStats->txSubmissions;
             auto submissionCount = static_cast<unsigned int>(count - completed);
 #ifdef HAJIMI_QUIC_TESTING
             // Expose partial completion deterministically when injecting syscall errors.
@@ -199,10 +201,10 @@ auto UdpBatchSocket::send(ilias::Buffer data, const IPEndpoint &remote,
             auto n = ::sendmmsg(mSocket.fd().get(), messages.data() + completed,
                 submissionCount, MSG_DONTWAIT | MSG_NOSIGNAL);
             if (n > 0) {
-                for (int i = 0; i < n; ++i) mStats.txBytes += messages[completed + i].msg_len;
+                for (int i = 0; i < n; ++i) mStats->txBytes += messages[completed + i].msg_len;
                 completed += n;
-                mStats.txDatagrams += n;
-                mStats.maxTxBatch = std::max(mStats.maxTxBatch, static_cast<size_t>(n));
+                mStats->txDatagrams += n;
+                mStats->maxTxBatch = std::max(mStats->maxTxBatch, static_cast<size_t>(n));
                 continue;
             }
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -227,14 +229,14 @@ auto UdpBatchSocket::send(ilias::Buffer data, const IPEndpoint &remote,
         IoVec vec{bytes};
         MsgHdr msg;
         msg.setEndpoint(remote).setBuffers(std::span{&vec, 1}).setControl(control);
-        ++mStats.txSubmissions;
+        ++mStats->txSubmissions;
         auto sent = co_await mSocket.sendmsg(msg);
         if (!sent) co_return Sent{completed, sent.error()};
         if (*sent != bytes.size()) co_return Sent{completed, std::make_error_code(std::errc::io_error)};
         ++completed;
-        ++mStats.txDatagrams;
-        mStats.txBytes += bytes.size();
-        mStats.maxTxBatch = std::max<size_t>(mStats.maxTxBatch, 1);
+        ++mStats->txDatagrams;
+        mStats->txBytes += bytes.size();
+        mStats->maxTxBatch = std::max<size_t>(mStats->maxTxBatch, 1);
     }
     co_return Sent{completed};
 }
@@ -260,7 +262,7 @@ auto UdpBatchSocket::receive() -> IoTask<std::span<const Received>> {
                 msg.setEndpoint(slot.remote).setBuffers(std::span{&vectors[i], 1}).setControl(slot.control.data());
                 messages[i].msg_hdr = msg;
             }
-            ++mStats.rxSubmissions;
+            ++mStats->rxSubmissions;
             auto n = ::recvmmsg(mSocket.fd().get(), messages.data(), static_cast<unsigned int>(mReceive.size()), MSG_DONTWAIT, nullptr);
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 ILIAS_CO_TRYV(co_await mSocket.poll(ilias::PollEvent::In));
@@ -271,7 +273,7 @@ auto UdpBatchSocket::receive() -> IoTask<std::span<const Received>> {
                 MutableMsgHdr msg{messages[i].msg_hdr};
                 size_t segment;
                 unsigned int ecn;
-                if (!receiveInfo(msg, messages[i].msg_len, segment, ecn)) { ++mStats.droppedReceives; continue; }
+                if (!receiveInfo(msg, messages[i].msg_len, segment, ecn)) { ++mStats->droppedReceives; continue; }
                 auto &slot = mReceive[i];
                 slot.bytes.commitBack(messages[i].msg_len);
                 mReceived[received++] = {ilias::makeBuffer(slot.bytes.data()), slot.remote, segment, ecn};
@@ -285,28 +287,28 @@ auto UdpBatchSocket::receive() -> IoTask<std::span<const Received>> {
             MutableIoVec vec{ilias::makeBuffer(slot.bytes.prepareBack(receiveCapacity))};
             MutableMsgHdr msg;
             msg.setEndpoint(slot.remote).setBuffers(std::span{&vec, 1}).setControl(slot.control.data());
-            ++mStats.rxSubmissions;
+            ++mStats->rxSubmissions;
             auto result = co_await mSocket.recvmsg(msg);
             if (!result) {
-                if (result.error() == ilias::SystemError::MessageTooLarge) { ++mStats.droppedReceives; continue; }
+                if (result.error() == ilias::SystemError::MessageTooLarge) { ++mStats->droppedReceives; continue; }
                 co_return Err(result.error());
             }
             size_t segment;
             unsigned int ecn;
-            if (!receiveInfo(msg, *result, segment, ecn)) { ++mStats.droppedReceives; continue; }
+            if (!receiveInfo(msg, *result, segment, ecn)) { ++mStats->droppedReceives; continue; }
             slot.bytes.commitBack(*result);
             mReceived[received++] = {ilias::makeBuffer(slot.bytes.data()), slot.remote, segment, ecn};
         }
         size_t datagrams = 0;
         for (size_t i = 0; i < received; ++i) {
             auto &msg = mReceived[i];
-            mStats.rxBytes += msg.bytes.size();
+            mStats->rxBytes += msg.bytes.size();
             auto count = msg.segmentSize ? (msg.bytes.size() + msg.segmentSize - 1) / msg.segmentSize : 1;
             datagrams += count;
-            if (count > 1) mStats.rxCoalescedDatagrams += count;
+            if (count > 1) mStats->rxCoalescedDatagrams += count;
         }
-        mStats.rxDatagrams += datagrams;
-        mStats.maxRxBatch = std::max(mStats.maxRxBatch, datagrams);
+        mStats->rxDatagrams += datagrams;
+        mStats->maxRxBatch = std::max(mStats->maxRxBatch, datagrams);
         if (received) co_return std::span<const Received>{mReceived.data(), received};
     }
 }

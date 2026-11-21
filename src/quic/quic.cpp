@@ -22,6 +22,7 @@ using ilias::Err;
 using ilias::IoResult;
 using ilias::IoTask;
 using ilias::IPEndpoint;
+using VersionPolicy = QuicContext::VersionPolicy;
 
 namespace {
 
@@ -47,6 +48,17 @@ constexpr size_t cidLength = 16;
 constexpr size_t packetSize = 1452;
 constexpr size_t streamChunkSize = 16 * 1024;
 constexpr uint64_t abandonedError = 1;
+constexpr std::array preferredVersions{NGTCP2_PROTO_VER_V2, NGTCP2_PROTO_VER_V1};
+
+auto supportedVersions(VersionPolicy policy) -> std::span<const uint32_t> {
+    std::span<const uint32_t> versions = preferredVersions;
+    switch (policy) {
+        case VersionPolicy::PreferV2: return versions;
+        case VersionPolicy::V1Only: return versions.last(1);
+        case VersionPolicy::V2Only: return versions.first(1);
+    }
+    return {};
+}
 
 auto timestamp() -> ngtcp2_tstamp {
     return static_cast<ngtcp2_tstamp>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -74,6 +86,24 @@ auto randomCid(ngtcp2_cid &cid) -> bool {
 
 auto address(IPEndpoint &endpoint) -> ngtcp2_addr {
     return {static_cast<ngtcp2_sockaddr *>(endpoint.data()), endpoint.length()};
+}
+
+auto endpoint(const ngtcp2_addr &addr) -> IPEndpoint {
+    IPEndpoint result;
+    if (addr.addrlen == sizeof(sockaddr_in) || addr.addrlen == sizeof(sockaddr_in6)) {
+        std::memcpy(result.data(), addr.addr, addr.addrlen);
+    }
+    return result;
+}
+
+auto forFamily(IPEndpoint remote, int family) -> IPEndpoint {
+    if (family == AF_INET6 && remote.family() == AF_INET) {
+        return {ilias::IPAddress6::fromV4Mapped(remote.address4()), remote.port()};
+    }
+    if (family == AF_INET && remote.family() == AF_INET6 && remote.address6().isV4Mapped()) {
+        return {*remote.address6().toV4(), remote.port()};
+    }
+    return remote;
 }
 
 // Never propagate C++ exceptions across a C callback boundary.
@@ -161,9 +191,11 @@ struct StreamState {
     uint64_t accepted = 0;
     uint64_t submitted = 0;
     uint64_t sent = 0;
+    uint64_t lostThrough = 0; // Unsent bytes recovered by ngtcp2 after a path change.
     bool readFin = false;
     bool writeFin = false;
     bool finSubmitted = false;
+    bool finWithData = false;
     bool finSent = false;
     bool closed = false;
     bool resetApplied = false;
@@ -187,9 +219,30 @@ struct PacketBatch {
     bool padding = false;
 };
 
+struct LocalSocket {
+    UdpBatchSocket udp;
+    IPEndpoint local;
+};
+
+struct ClientPath {
+    std::shared_ptr<LocalSocket> socket;
+    ilias::StopHandle receiver;
+
+    ~ClientPath() {
+        if (receiver) receiver.stop();
+    }
+};
+
+struct Migration {
+    std::unique_ptr<ClientPath> path;
+    std::optional<std::error_code> result;
+};
+
 struct PendingPackets {
     SkBuffer bytes;
     PacketBatch batch;
+    std::shared_ptr<LocalSocket> socket;
+    IPEndpoint remote;
     size_t segment = 0;
     size_t completed = 0;
     unsigned int ecn = 0;
@@ -198,8 +251,9 @@ struct PendingPackets {
 struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
     std::shared_ptr<SkBufferPool> pool;
     std::weak_ptr<ContextState> context;
-    IPEndpoint local;
-    IPEndpoint remote;
+    std::unique_ptr<ClientPath> clientPath;
+    std::shared_ptr<Migration> migration;
+    std::optional<IPEndpoint> validatingPeer;
     ngtcp2_conn *conn = nullptr;
     std::unique_ptr<TlsSession> tls;
     ilias::Event changed;
@@ -217,6 +271,8 @@ struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
     ngtcp2_tstamp retryUntil = 0;
     bool server = false;
     bool handshake = false;
+    bool confirmed = false;
+    uint32_t retryVersion = 0;
     bool queued = false;
     bool closeRequested = false;
     bool closeSent = false;
@@ -224,6 +280,8 @@ struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
     ngtcp2_tstamp retireAt = 0;
     ngtcp2_ccerr closeReason{};
     SkBuffer closePacket;
+    std::shared_ptr<LocalSocket> closeSocket;
+    IPEndpoint closeRemote;
     std::optional<uint64_t> appError;
     std::error_code error;
 
@@ -233,6 +291,11 @@ struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
     }
 
     auto ensureStream(int64_t id) -> std::shared_ptr<StreamState>;
+    auto path() const -> const ngtcp2_path & { return *ngtcp2_conn_get_path2(conn); }
+    auto localEndpoint() const -> IPEndpoint { return endpoint(path().local); }
+    auto remoteEndpoint() const -> IPEndpoint { return endpoint(path().remote); }
+    auto findSocket(const ContextState &owner, IPEndpoint local) const -> std::shared_ptr<LocalSocket>;
+    auto finishMigration(std::error_code error) -> void;
     auto notify() -> void;
     auto fail(std::error_code value) -> void;
     auto handleError(int value) -> void;
@@ -241,14 +304,20 @@ struct ConnectionState : std::enable_shared_from_this<ConnectionState> {
 };
 
 struct ContextState {
+    struct VersionReply {
+        SkBuffer bytes;
+        IPEndpoint remote;
+    };
+
     explicit ContextState(QuicContext::Config value) : config(std::move(value)) {}
 
     QuicContext::Config config;
     std::shared_ptr<SkBufferPool> pool = std::make_shared<SkBufferPool>(
         std::initializer_list<SkBufferPool::ClassInfo>{{256, 128}, {2048, 32}, {16384, 8}, {65536, 2}},
         config.memoryResource);
-    UdpBatchSocket socket;
-    IPEndpoint local;
+    std::shared_ptr<LocalSocket> socket;
+    std::shared_ptr<QuicContext::IoStats> stats = std::make_shared<QuicContext::IoStats>();
+    ilias::TaskScope pathReceivers;
     TlsContext tls;
     ilias::Event wake;
     ilias::Event changed;
@@ -257,6 +326,7 @@ struct ContextState {
     ngtcp2_tstamp armedDeadline = 0;
     std::vector<std::shared_ptr<ConnectionState>> connections;
     std::deque<std::shared_ptr<ConnectionState>> incoming;
+    std::deque<VersionReply> versionReplies;
     std::map<std::string, std::weak_ptr<ConnectionState>> routes;
     bool running = false;
     bool stopped = false;
@@ -300,7 +370,11 @@ struct ContextState {
 
     auto removeExpired(ngtcp2_tstamp now) -> void {
         std::erase_if(connections, [now](auto &connection) {
-            return connection->retireAt != 0 && connection->retireAt <= now;
+            if (!connection->retireAt || connection->retireAt > now) return false;
+            connection->pending.reset();
+            connection->clientPath.reset();
+            connection->closeSocket.reset();
+            return true;
         });
         std::erase_if(routes, [now](auto &entry) {
             auto connection = entry.second.lock();
@@ -317,7 +391,7 @@ auto ContextTestAccess::setNextBindFault(UdpBatchSocket::FaultInjector fault) ->
 }
 
 auto ContextTestAccess::setFaultInjector(QuicContext &context, UdpBatchSocket::FaultInjector fault) -> void {
-    context.mState->socket.setFaultInjector(std::move(fault));
+    context.mState->socket->udp.setFaultInjector(std::move(fault));
 }
 #endif
 
@@ -382,11 +456,27 @@ auto ConnectionState::notify() -> void {
     std::erase_if(incoming, [](auto &stream) { return stream->closed && bool(stream->readError); });
 }
 
+auto ConnectionState::findSocket(const ContextState &owner, IPEndpoint local) const -> std::shared_ptr<LocalSocket> {
+    if (clientPath && clientPath->socket->local == local) return clientPath->socket;
+    if (migration && migration->path->socket->local == local) return migration->path->socket;
+    if (owner.socket->local == local) return owner.socket;
+    return {};
+}
+
+auto ConnectionState::finishMigration(std::error_code error) -> void {
+    if (!migration) return;
+    auto completed = std::exchange(migration, {});
+    if (!error) clientPath = std::move(completed->path);
+    else completed->path.reset();
+    completed->result = error;
+}
+
 auto ConnectionState::fail(std::error_code value) -> void {
     if (error) {
         return;
     }
     error = value;
+    finishMigration(value);
     for (auto &[id, stream] : streams) {
         stream->readError = value;
         stream->writeError = value;
@@ -408,6 +498,15 @@ auto ConnectionState::close(uint64_t value) noexcept -> void {
 auto ConnectionState::handleError(int value) -> void {
     if (value == 0) {
         return;
+    }
+    if (value == NGTCP2_ERR_RECV_VERSION_NEGOTIATION) {
+        fail(transportError(value));
+        draining = true;
+        retireAt = timestamp();
+        return;
+    }
+    if (value == NGTCP2_ERR_CALLBACK_FAILURE && error == transportError(NGTCP2_ERR_VERSION_NEGOTIATION_FAILURE)) {
+        value = NGTCP2_ERR_VERSION_NEGOTIATION_FAILURE;
     }
     if (value == NGTCP2_ERR_DRAINING) {
         draining = true;
@@ -455,6 +554,15 @@ static auto callbacks() -> ngtcp2_callbacks {
     cb.delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb;
     cb.delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
     cb.version_negotiation = ngtcp2_crypto_version_negotiation_cb;
+    cb.recv_version_negotiation = [](ngtcp2_conn *, const ngtcp2_pkt_hd *, const uint32_t *offered,
+        size_t count, void *data) -> int {
+        auto &self = *static_cast<ConnectionState *>(data);
+        if (auto owner = self.context.lock()) {
+            auto preferred = supportedVersions(owner->config.versions);
+            self.retryVersion = ngtcp2_select_version(preferred.data(), preferred.size(), offered, count);
+        }
+        return 0;
+    };
     cb.get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb;
     cb.rand = [](uint8_t *dest, size_t size, const ngtcp2_rand_ctx *) {
         if (RAND_bytes(dest, static_cast<int>(size)) != 1) {
@@ -484,7 +592,7 @@ static auto callbacks() -> ngtcp2_callbacks {
             return 0;
         });
     };
-    cb.handshake_completed = [](ngtcp2_conn *, void *data) -> int {
+    cb.handshake_completed = [](ngtcp2_conn *conn, void *data) -> int {
         auto &self = *static_cast<ConnectionState *>(data);
         auto owner = self.context.lock();
         const unsigned char *alpn = nullptr;
@@ -500,7 +608,42 @@ static auto callbacks() -> ngtcp2_callbacks {
             self.fail(make_error_code(QuicError::Tls));
             return NGTCP2_ERR_CALLBACK_FAILURE;
         }
+        auto version = ngtcp2_conn_get_negotiated_version2(conn);
+        auto supported = supportedVersions(owner->config.versions);
+        auto peer = ngtcp2_conn_get_remote_transport_params2(conn);
+        if (std::find(supported.begin(), supported.end(), version) == supported.end() ||
+            (version == NGTCP2_PROTO_VER_V2 && !peer->version_info_present)) {
+            self.fail(transportError(NGTCP2_ERR_VERSION_NEGOTIATION_FAILURE));
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
+        ngtcp2_duration interval = owner->config.keepAliveInterval.count() * NGTCP2_MILLISECONDS;
+        if (interval) {
+            ngtcp2_duration idle = owner->config.idleTimeout.count() * NGTCP2_MILLISECONDS;
+            auto peerIdle = peer->max_idle_timeout;
+            if (peerIdle) idle = std::min(idle, peerIdle);
+            ngtcp2_conn_set_keep_alive_timeout(conn, std::min(interval, idle / 2));
+        }
         self.handshake = true;
+        return 0;
+    };
+    cb.handshake_confirmed = [](ngtcp2_conn *, void *data) -> int {
+        static_cast<ConnectionState *>(data)->confirmed = true;
+        return 0;
+    };
+    cb.begin_path_validation = [](ngtcp2_conn *, uint32_t, const ngtcp2_path *path,
+        const ngtcp2_path *fallback, void *data) -> int {
+        auto &self = *static_cast<ConnectionState *>(data);
+        if (self.server && fallback) self.validatingPeer = endpoint(path->remote);
+        return 0;
+    };
+    cb.path_validation = [](ngtcp2_conn *, uint32_t, const ngtcp2_path *path,
+        const ngtcp2_path *, ngtcp2_path_validation_result result, void *data) -> int {
+        auto &self = *static_cast<ConnectionState *>(data);
+        if (self.validatingPeer == endpoint(path->remote)) self.validatingPeer.reset();
+        if (self.migration && self.migration->path->socket->local == endpoint(path->local)) {
+            self.finishMigration(result == NGTCP2_PATH_VALIDATION_RESULT_SUCCESS ? std::error_code{} :
+                std::make_error_code(std::errc::host_unreachable));
+        }
         return 0;
     };
     cb.stream_open = [](ngtcp2_conn *, int64_t id, void *data) -> int {
@@ -532,6 +675,11 @@ static auto callbacks() -> ngtcp2_callbacks {
             return 0;
         }
         auto &stream = *it->second;
+        stream.sent = std::max(stream.sent, offset + size);
+        if (stream.lostThrough <= offset + size) stream.lostThrough = 0;
+        if (stream.finSubmitted && (size == 0 || (stream.finWithData && offset + size == stream.submitted))) {
+            stream.finSent = true;
+        }
         while (!stream.tx.empty() && stream.tx.front().offset + stream.tx.front().bytes.size() <= offset + size) {
             auto count = stream.tx.front().bytes.size();
             stream.buffered -= count;
@@ -594,16 +742,20 @@ static auto callbacks() -> ngtcp2_callbacks {
 }
 
 static auto makeConnection(const std::shared_ptr<ContextState> &context, IPEndpoint remote,
-    const std::string &serverName, const ngtcp2_pkt_hd *initial = nullptr)
+    const std::string &serverName, const ngtcp2_pkt_hd *initial,
+    uint32_t version = 0, uint32_t originalVersion = 0)
     -> IoResult<std::shared_ptr<ConnectionState>> {
-    if (context->connections.size() >= context->config.maxConnections) {
+    auto now = timestamp();
+    if (context->connections.size() >= context->config.maxConnections &&
+        static_cast<size_t>(std::count_if(context->connections.begin(), context->connections.end(), [now](auto &conn) {
+            return !conn->retireAt || conn->retireAt > now;
+        })) >= context->config.maxConnections) {
         return Err(std::make_error_code(std::errc::no_buffer_space));
     }
     auto state = std::make_shared<ConnectionState>();
     state->pool = context->pool;
     state->context = context;
-    state->local = context->local;
-    state->remote = remote;
+    auto local = context->socket->local;
     state->server = initial != nullptr;
     ngtcp2_ccerr_default(&state->closeReason);
     ngtcp2_cid scid{}, dcid{};
@@ -616,9 +768,15 @@ static auto makeConnection(const std::shared_ptr<ContextState> &context, IPEndpo
     auto &config = context->config;
     ngtcp2_settings settings;
     ngtcp2_settings_default(&settings);
-    settings.initial_ts = timestamp();
+    settings.initial_ts = now;
     settings.handshake_timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(config.handshakeTimeout).count();
     settings.max_tx_udp_payload_size = packetSize;
+    auto versions = supportedVersions(config.versions);
+    settings.preferred_versions = versions.data();
+    settings.preferred_versionslen = versions.size();
+    settings.available_versions = versions.data();
+    settings.available_versionslen = versions.size();
+    settings.original_version = originalVersion;
     ngtcp2_transport_params params;
     ngtcp2_transport_params_default(&params);
     params.initial_max_data = config.connectionWindow;
@@ -627,7 +785,6 @@ static auto makeConnection(const std::shared_ptr<ContextState> &context, IPEndpo
     params.initial_max_streams_bidi = config.maxStreams;
     params.max_idle_timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(config.idleTimeout).count();
     params.active_connection_id_limit = 4;
-    params.disable_active_migration = 1;
     if (initial) {
         params.original_dcid = initial->dcid;
         params.original_dcid_present = 1;
@@ -637,13 +794,13 @@ static auto makeConnection(const std::shared_ptr<ContextState> &context, IPEndpo
         }
     }
     ngtcp2_path path{
-        .local = address(state->local),
-        .remote = address(state->remote),
+        .local = address(local),
+        .remote = address(remote),
     };
     auto cb = callbacks();
     auto rv = initial ? ngtcp2_conn_server_new(&state->conn, &dcid, &scid, &path,
         initial->version, &cb, &settings, &params, nullptr, state.get()) :
-        ngtcp2_conn_client_new(&state->conn, &dcid, &scid, &path, NGTCP2_PROTO_VER_V1,
+        ngtcp2_conn_client_new(&state->conn, &dcid, &scid, &path, version,
             &cb, &settings, &params, nullptr, state.get());
     if (rv != 0) {
         return Err(transportError(rv));
@@ -658,11 +815,29 @@ static auto makeConnection(const std::shared_ptr<ContextState> &context, IPEndpo
     return state;
 }
 
-static auto receive(const std::shared_ptr<ContextState> &context, IPEndpoint remote,
+static auto queueVersionReply(ContextState &context, const ngtcp2_version_cid &cid, IPEndpoint remote) -> void {
+    if (context.versionReplies.size() >= UdpBatchSocket::receiveSlots) return;
+    auto versions = supportedVersions(context.config.versions);
+    auto capacity = 7 + cid.scidlen + cid.dcidlen + versions.size_bytes();
+    auto buffer = context.pool->allocate(capacity);
+    auto data = buffer.prepareBack(capacity);
+    auto size = ngtcp2_pkt_write_version_negotiation(reinterpret_cast<uint8_t *>(data.data()), data.size(), 0,
+        cid.scid, cid.scidlen, cid.dcid, cid.dcidlen, versions.data(), versions.size());
+    if (size < 0) return;
+    buffer.commitBack(size);
+    context.versionReplies.push_back({std::move(buffer), remote});
+}
+
+static auto receive(const std::shared_ptr<ContextState> &context, IPEndpoint local, IPEndpoint remote,
     const uint8_t *packet, size_t size, ngtcp2_tstamp now, unsigned int ecn) -> void {
+    if (!size) return;
     ngtcp2_version_cid cid{};
-    if (ngtcp2_pkt_decode_version_cid(&cid, packet, size, cidLength) != 0) {
-        return; // Ignore unrelated UDP traffic and malformed headers.
+    auto decoded = ngtcp2_pkt_decode_version_cid(&cid, packet, size, cidLength);
+    if (decoded != 0) {
+        if (decoded == NGTCP2_ERR_VERSION_NEGOTIATION && context->config.role == QuicContext::Role::Server) {
+            queueVersionReply(*context, cid, remote);
+        }
+        return;
     }
     std::shared_ptr<ConnectionState> state;
     if (auto it = context->routes.find(cidKey(cid.dcid, cid.dcidlen)); it != context->routes.end()) {
@@ -670,7 +845,12 @@ static auto receive(const std::shared_ptr<ContextState> &context, IPEndpoint rem
     }
     if (!state && context->config.role == QuicContext::Role::Server) {
         ngtcp2_pkt_hd initial{};
-        if (ngtcp2_accept(&initial, packet, size) != 0 || initial.version != NGTCP2_PROTO_VER_V1) {
+        if (ngtcp2_accept(&initial, packet, size) != 0) {
+            return;
+        }
+        auto versions = supportedVersions(context->config.versions);
+        if (std::find(versions.begin(), versions.end(), initial.version) == versions.end()) {
+            queueVersionReply(*context, cid, remote);
             return;
         }
         auto created = makeConnection(context, remote, {}, &initial);
@@ -679,15 +859,19 @@ static auto receive(const std::shared_ptr<ContextState> &context, IPEndpoint rem
         }
         state = std::move(*created);
     }
-    if (!state || state->draining || remote != state->remote) {
+    if (!state || state->draining || (state->server && !state->handshake && remote != state->remoteEndpoint()) ||
+        (!state->server && local != state->localEndpoint() &&
+            (!state->migration || local != state->migration->path->socket->local))) {
         return;
     }
-    if (state->closeSent) {
-        state->closeRequested = true; // Retransmit CONNECTION_CLOSE on incoming traffic.
+    if (state->closeSocket) {
+        if (local == state->closeSocket->local && remote == state->closeRemote) {
+            state->closeRequested = true; // Retransmit CONNECTION_CLOSE on its original path.
+        }
         return;
     }
     ngtcp2_path path{
-        .local = address(state->local),
+        .local = address(local),
         .remote = address(remote),
     };
     ngtcp2_pkt_info pi{};
@@ -764,6 +948,7 @@ static auto writePacket(ngtcp2_conn *, ngtcp2_path *path, ngtcp2_pkt_info *pi,
         if (dataSize >= 0) {
             stream->submitted += dataSize;
             stream->finSubmitted = fin && static_cast<size_t>(dataSize) == available;
+            stream->finWithData = stream->finSubmitted && dataSize != 0;
         }
         break;
     }
@@ -777,11 +962,10 @@ static auto writePacket(ngtcp2_conn *, ngtcp2_path *path, ngtcp2_pkt_info *pi,
     return n;
 }
 
-static auto sendPending(const std::shared_ptr<ContextState> &context,
-    const std::shared_ptr<ConnectionState> &state) -> IoTask<void> {
+static auto sendPending(const std::shared_ptr<ConnectionState> &state) -> IoTask<void> {
     auto &pending = *state->pending;
     auto bytes = ilias::makeBuffer(pending.bytes.data()).subspan(pending.completed * pending.segment);
-    auto sent = co_await context->socket.send(bytes, state->remote, std::min(pending.segment, bytes.size()), pending.ecn);
+    auto sent = co_await pending.socket->udp.send(bytes, pending.remote, std::min(pending.segment, bytes.size()), pending.ecn);
     auto end = pending.completed + sent.datagrams;
     assert(end <= pending.batch.count);
     for (size_t i = pending.completed; i < end; ++i) {
@@ -793,11 +977,20 @@ static auto sendPending(const std::shared_ptr<ContextState> &context,
     }
     pending.completed = end;
     state->notify();
-    // Only a rejected MTU probe can be discarded as a local packet loss.
-    auto probe = sent.error == ilias::SystemError::MessageTooLarge &&
-        pending.batch.count == 1 && !pending.batch.receipts[0].stream &&
-        pending.bytes.size() > NGTCP2_MAX_UDP_PAYLOAD_SIZE;
-    if (sent.error && !probe) co_return Err(sent.error);
+    if (sent.error) {
+        auto mtuProbe = sent.error == ilias::SystemError::MessageTooLarge &&
+            pending.batch.count == 1 && !pending.batch.receipts[0].stream &&
+            pending.bytes.size() > NGTCP2_MAX_UDP_PAYLOAD_SIZE;
+        auto changingPath = state->migration || state->validatingPeer == pending.remote ||
+            pending.remote != state->remoteEndpoint() || pending.socket->local != state->localEndpoint();
+        if (!mtuProbe && !(changingPath && retryableUdpError(sent.error))) co_return Err(sent.error);
+        // Let QUIC recover the unsent suffix without blocking path validation.
+        for (size_t i = end; i < pending.batch.count; ++i) {
+            auto &receipt = pending.batch.receipts[i];
+            if (receipt.stream) receipt.stream->lostThrough = std::max(receipt.stream->lostThrough, receipt.offset);
+        }
+        state->wake();
+    }
     ngtcp2_conn_update_pkt_tx_time(state->conn, timestamp());
     state->pending.reset();
     co_return {};
@@ -809,11 +1002,16 @@ static auto sendPackets(const std::shared_ptr<ContextState> &context,
         if (state->closePacket.empty()) {
             auto buffer = state->pool->allocate(packetSize);
             auto data = buffer.prepareBack(packetSize);
-            auto n = ngtcp2_conn_write_connection_close(state->conn, nullptr, nullptr,
+            ngtcp2_path_storage path;
+            ngtcp2_path_storage_zero(&path);
+            auto n = ngtcp2_conn_write_connection_close(state->conn, &path.path, nullptr,
                 reinterpret_cast<uint8_t *>(data.data()), data.size(), &state->closeReason, timestamp());
             if (n < 0) {
                 co_return Err(transportError(static_cast<int>(n)));
             }
+            state->closeSocket = state->findSocket(*context, endpoint(path.path.local));
+            state->closeRemote = endpoint(path.path.remote);
+            if (!state->closeSocket) co_return Err(transportError(NGTCP2_ERR_NO_VIABLE_PATH));
             if (n == 0) {
                 state->closeRequested = false;
                 co_return {};
@@ -822,7 +1020,8 @@ static auto sendPackets(const std::shared_ptr<ContextState> &context,
             state->closePacket = std::move(buffer);
         }
         // ngtcp2 enters closing after encoding once; retransmit the cached packet.
-        auto closed = co_await context->socket.send(ilias::makeBuffer(state->closePacket.data()), state->remote, state->closePacket.size());
+        auto closed = co_await state->closeSocket->udp.send(ilias::makeBuffer(state->closePacket.data()),
+            state->closeRemote, state->closePacket.size());
         if (closed.error) co_return Err(closed.error);
         state->closeRequested = false;
         state->closeSent = true;
@@ -835,7 +1034,7 @@ static auto sendPackets(const std::shared_ptr<ContextState> &context,
         state->pending.reset();
         co_return {};
     }
-    if (state->pending) co_return co_await sendPending(context, state);
+    if (state->pending) co_return co_await sendPending(state);
     applyStreamChanges(*state);
     if (state->error) co_return {};
     // One bounded quantum per connection; all buffers survive asynchronous I/O.
@@ -848,7 +1047,9 @@ static auto sendPackets(const std::shared_ptr<ContextState> &context,
         packetSize, UdpBatchSocket::sendCapacity) : packetSize;
     size_t segment = 0;
     ngtcp2_pkt_info pi{};
-    auto n = ngtcp2_conn_write_aggregate_pkt2(state->conn, nullptr, &pi,
+    ngtcp2_path_storage path;
+    ngtcp2_path_storage_zero(&path);
+    auto n = ngtcp2_conn_write_aggregate_pkt2(state->conn, &path.path, &pi,
         reinterpret_cast<uint8_t *>(packet.data()), limit, &segment, writePacket,
         context->config.udpBatching ? UdpBatchSocket::maxSegments : 1, timestamp());
     state->writingBatch = nullptr;
@@ -857,25 +1058,32 @@ static auto sendPackets(const std::shared_ptr<ContextState> &context,
         co_return {};
     }
     if (n == 0) co_return {};
+    auto socket = state->findSocket(*context, endpoint(path.path.local));
+    if (!socket) {
+        // ngtcp2 may still have a probing response for a retired local socket.
+        state->wake();
+        co_return {};
+    }
     buffer.commitBack(n);
-    state->pending.emplace(PendingPackets{std::move(buffer), std::move(batch), segment, 0, pi.ecn});
-    co_return co_await sendPending(context, state);
+    state->pending.emplace(PendingPackets{std::move(buffer), std::move(batch), std::move(socket),
+        endpoint(path.path.remote), segment, 0, pi.ecn});
+    co_return co_await sendPending(state);
 }
 
-static auto receiveWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
+static auto receiveWorker(std::shared_ptr<ContextState> state, std::shared_ptr<LocalSocket> socket) -> IoTask<void> {
     size_t handled = 0;
     auto turn = timestamp();
     UdpBackoff backoff;
     while (!state->stopped) {
         co_await ilias::this_coro::stopPoint();
-        auto result = co_await state->socket.receive();
+        auto result = co_await socket->udp.receive();
         if (!result) {
             auto error = result.error();
             if (state->stopped) break;
             if (!retryableUdpError(error)) {
                 std::println(stderr, "[QUIC/Recv] error={} ({}:{})",
                     error.message(), error.category().name(), error.value());
-                state->stop(error); // Save the cause before finally() performs shutdown.
+                if (socket == state->socket) state->stop(error);
                 co_return Err(error);
             }
             backoff.report("Recv", error);
@@ -893,7 +1101,8 @@ static auto receiveWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
             auto remaining = message.bytes;
             do {
                 auto size = message.segmentSize ? std::min(message.segmentSize, remaining.size()) : remaining.size();
-                receive(state, message.remote, reinterpret_cast<const uint8_t *>(remaining.data()), size, now, message.ecn);
+                receive(state, socket->local, message.remote,
+                    reinterpret_cast<const uint8_t *>(remaining.data()), size, now, message.ecn);
                 remaining = remaining.subspan(size);
                 if (++count % 32 == 0) now = timestamp();
             } while (!remaining.empty());
@@ -908,6 +1117,20 @@ static auto receiveWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
         }
     }
     co_return {};
+}
+
+static auto receiveClientPath(std::shared_ptr<ContextState> owner, std::shared_ptr<LocalSocket> socket,
+    std::weak_ptr<ConnectionState> connection) -> Task<void> {
+    auto result = co_await receiveWorker(std::move(owner), socket);
+    auto state = connection.lock();
+    if (!result && state && state->clientPath && state->clientPath->socket == socket) {
+        state->fail(result.error());
+        state->draining = true;
+        state->closeRequested = false;
+        state->retireAt = timestamp();
+        state->notify();
+        state->wake();
+    }
 }
 
 static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
@@ -935,7 +1158,7 @@ static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
                 connection->retryAt = connection->retryUntil = 0;
                 connection->notify();
                 std::println(stderr, "[QUIC/Send] remote={} UDP retry deadline reached; connection retired",
-                    connection->remote);
+                    connection->remoteEndpoint());
                 continue;
             }
             if (connection->retryAt > now) continue;
@@ -949,7 +1172,8 @@ static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
                 if (state->stopped) break;
                 auto error = sent.error();
                 if (retryableUdpError(error)) {
-                    connection->sendBackoff.report("Send", error, &connection->remote);
+                    auto remote = connection->remoteEndpoint();
+                    connection->sendBackoff.report("Send", error, &remote);
                     now = timestamp();
                     if (!connection->retryUntil) {
                         auto timeout = connection->handshake ? state->config.idleTimeout : state->config.handshakeTimeout;
@@ -959,7 +1183,7 @@ static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
                 }
                 else {
                     std::println(stderr, "[QUIC/Send] remote={} error={} ({}:{})",
-                        connection->remote, error.message(), error.category().name(), error.value());
+                        connection->remoteEndpoint(), error.message(), error.category().name(), error.value());
                     using E = ilias::SystemError;
                     if (error.category() != quicErrorCategory && error != E::AddressFamilyNotSupported &&
                         error != E::DestinationAddressRequired) {
@@ -987,6 +1211,12 @@ static auto sendWorker(std::shared_ptr<ContextState> state) -> IoTask<void> {
         state->notify();
         if (state->stopped) {
             break;
+        }
+        for (auto count = state->versionReplies.size(); count && !state->stopped; --count) {
+            auto reply = std::move(state->versionReplies.front());
+            state->versionReplies.pop_front();
+            auto bytes = ilias::makeBuffer(reply.bytes.data());
+            auto _ = co_await state->socket->udp.send(bytes, reply.remote, bytes.size());
         }
         auto deadline = timestamp() + NGTCP2_SECONDS;
         for (auto &connection : state->connections) {
@@ -1043,8 +1273,13 @@ static auto runContext(std::shared_ptr<ContextState> state) -> IoTask<void> {
     state->running = true;
     ScopeExit cleanup{[&]() {
         state->stop(std::make_error_code(std::errc::operation_canceled));
-        state->socket.close();
-        for (auto &connection : state->connections) connection->pending.reset();
+        state->socket->udp.close();
+        state->versionReplies.clear();
+        for (auto &connection : state->connections) {
+            connection->pending.reset();
+            connection->clientPath.reset();
+            connection->closeSocket.reset();
+        }
         state->incoming.clear();
         state->routes.clear();
         state->connections.clear();
@@ -1052,8 +1287,10 @@ static auto runContext(std::shared_ptr<ContextState> state) -> IoTask<void> {
     }};
     // Keep one receive alive: racing recvfrom against a wakeup can discard
     // a datagram that completes at the same time as cancellation.
-    auto [received, sent, timer] = co_await (ilias::whenAny(receiveWorker(state), sendWorker(state), timerWorker(state)) |
-        ilias::finally(closeConnections(state)));
+    auto [received, sent, timer] = co_await (
+        ilias::whenAny(receiveWorker(state, state->socket), sendWorker(state), timerWorker(state)) |
+        ilias::finally(closeConnections(state)) |
+        ilias::finally(state->pathReceivers.shutdown()));
     if (received && !*received) {
         state->stop(received->error());
         co_return Err(received->error());
@@ -1063,6 +1300,30 @@ static auto runContext(std::shared_ptr<ContextState> state) -> IoTask<void> {
         co_return Err(sent->error());
     }
     co_return {};
+}
+
+static auto bindSocket(ContextState &state, IPEndpoint local) -> IoResult<std::shared_ptr<LocalSocket>> {
+    ILIAS_TRY(auto socket, ilias::Socket::make(local.family(), SOCK_DGRAM, IPPROTO_UDP));
+    if (local.family() == AF_INET6) {
+        ILIAS_TRYV(socket.setOption(ilias::sockopt::Ipv6Only{false}));
+#if defined(_WIN32) || defined(__linux__)
+        // Let QUIC probe without IP fragmentation or a stale kernel path MTU.
+        ILIAS_TRYV(socket.setOption(ilias::sockopt::OptionT<IPPROTO_IPV6, IPV6_MTU_DISCOVER, int>{IP_PMTUDISC_PROBE}));
+#elif defined(IPV6_DONTFRAG)
+        ILIAS_TRYV(socket.setOption(ilias::sockopt::OptionT<IPPROTO_IPV6, IPV6_DONTFRAG, int>{1}));
+#endif
+    }
+    else {
+#if defined(_WIN32) || defined(__linux__)
+        ILIAS_TRYV(socket.setOption(ilias::sockopt::OptionT<IPPROTO_IP, IP_MTU_DISCOVER, int>{IP_PMTUDISC_PROBE}));
+#elif defined(IP_DONTFRAG)
+        ILIAS_TRYV(socket.setOption(ilias::sockopt::OptionT<IPPROTO_IP, IP_DONTFRAG, int>{1}));
+#endif
+    }
+    ILIAS_TRYV(socket.bind(local));
+    ILIAS_TRY(auto udp, UdpBatchSocket::from(std::move(socket), *state.pool, state.config.udpBatching, state.stats));
+    ILIAS_TRY(local, udp.localEndpoint());
+    return std::make_shared<LocalSocket>(LocalSocket{std::move(udp), local});
 }
 
 } // namespace quic
@@ -1082,9 +1343,12 @@ auto QuicContext::operator =(QuicContext &&other) noexcept -> QuicContext & {
 
 auto QuicContext::bind(IPEndpoint local, Config config) -> IoTask<QuicContext> {
     if ((config.role != Role::Client && config.role != Role::Server) ||
+        supportedVersions(config.versions).empty() ||
         config.alpn.empty() || config.alpn.size() > 255 || config.handshakeTimeout.count() <= 0 ||
         config.handshakeTimeout.count() > NGTCP2_MAX_VARINT / NGTCP2_MILLISECONDS ||
         config.idleTimeout.count() > NGTCP2_MAX_VARINT / NGTCP2_MILLISECONDS ||
+        config.keepAliveInterval.count() < 0 ||
+        config.keepAliveInterval.count() > NGTCP2_MAX_VARINT / NGTCP2_MILLISECONDS ||
         config.idleTimeout.count() <= 0 || config.maxConnections == 0 || config.maxStreams == 0 ||
         config.maxStreams > (NGTCP2_MAX_VARINT / 4) || config.streamWindow == 0 ||
         config.connectionWindow == 0 || config.sendBufferLimit == 0 || config.connectionSendBufferLimit == 0 ||
@@ -1094,29 +1358,10 @@ auto QuicContext::bind(IPEndpoint local, Config config) -> IoTask<QuicContext> {
     }
     auto state = std::make_shared<quic::ContextState>(std::move(config));
     ILIAS_CO_TRY(state->tls, quic::makeTlsContext(state->config));
-    ILIAS_CO_TRY(auto socket, ilias::Socket::make(local.family(), SOCK_DGRAM, IPPROTO_UDP));
-    if (local.family() == AF_INET6) {
-        ILIAS_CO_TRYV(socket.setOption(ilias::sockopt::Ipv6Only{false}));
-#if defined(_WIN32) || defined(__linux__)
-        // Let QUIC probe without IP fragmentation or a stale kernel path MTU.
-        ILIAS_CO_TRYV(socket.setOption(ilias::sockopt::OptionT<IPPROTO_IPV6, IPV6_MTU_DISCOVER, int>{IP_PMTUDISC_PROBE}));
-#elif defined(IPV6_DONTFRAG)
-        ILIAS_CO_TRYV(socket.setOption(ilias::sockopt::OptionT<IPPROTO_IPV6, IPV6_DONTFRAG, int>{1}));
-#endif
-    }
-    else {
-#if defined(_WIN32) || defined(__linux__)
-        ILIAS_CO_TRYV(socket.setOption(ilias::sockopt::OptionT<IPPROTO_IP, IP_MTU_DISCOVER, int>{IP_PMTUDISC_PROBE}));
-#elif defined(IP_DONTFRAG)
-        ILIAS_CO_TRYV(socket.setOption(ilias::sockopt::OptionT<IPPROTO_IP, IP_DONTFRAG, int>{1}));
-#endif
-    }
-    ILIAS_CO_TRYV(socket.bind(local));
-    ILIAS_CO_TRY(state->socket, quic::UdpBatchSocket::from(std::move(socket), *state->pool, state->config.udpBatching));
+    ILIAS_CO_TRY(state->socket, quic::bindSocket(*state, local));
 #ifdef HAJIMI_QUIC_TESTING
-    state->socket.setFaultInjector(std::exchange(quic::nextBindFault, {}));
+    state->socket->udp.setFaultInjector(std::exchange(quic::nextBindFault, {}));
 #endif
-    ILIAS_CO_TRY(state->local, state->socket.localEndpoint());
     co_return QuicContext{std::move(state)};
 }
 
@@ -1134,11 +1379,11 @@ auto QuicContext::localEndpoint() const -> IoResult<IPEndpoint> {
     if (!mState) {
         return Err(std::make_error_code(std::errc::bad_file_descriptor));
     }
-    return mState->local;
+    return mState->socket->local;
 }
 
 auto QuicContext::ioStats() const noexcept -> IoStats {
-    return mState ? mState->socket.stats() : IoStats{};
+    return mState ? mState->socket->udp.stats() : IoStats{};
 }
 
 auto QuicContext::connect(std::string address) -> IoTask<QuicConnection> {
@@ -1173,7 +1418,7 @@ auto QuicContext::connect(std::string address) -> IoTask<QuicConnection> {
     }
 
     ilias::addrinfo_t hints{};
-    hints.ai_family = state->local.family() == AF_INET ? AF_INET : AF_UNSPEC;
+    hints.ai_family = state->socket->local.family() == AF_INET ? AF_INET : AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_protocol = IPPROTO_UDP;
     hints.ai_flags = AI_NUMERICSERV;
@@ -1235,31 +1480,38 @@ auto QuicContext::connect(std::string address) -> IoTask<QuicConnection> {
 
 auto QuicContext::connect(IPEndpoint remote, std::string serverName) -> IoTask<QuicConnection> {
     auto state = mState;
-    if (state && state->local.family() == AF_INET6 && remote.family() == AF_INET) {
-        remote = IPEndpoint{ilias::IPAddress6::fromV4Mapped(remote.address4()), remote.port()};
+    if (!state || state->config.role != Role::Client) {
+        co_return Err(std::make_error_code(std::errc::invalid_argument));
     }
-    if (!state || state->config.role != Role::Client || remote.family() != state->local.family()) {
+    auto family = state->socket->local.family();
+    remote = forFamily(remote, family);
+    if (remote.family() != family) {
         co_return Err(std::make_error_code(std::errc::invalid_argument));
     }
     if (state->stopped) {
         co_return Err(state->error);
     }
-    ILIAS_CO_TRY(auto connection, quic::makeConnection(state, remote, serverName));
-    bool completed = false;
-    ScopeExit cleanup{[&]() {
-        if (!completed) {
-            connection->close(abandonedError);
+    // Start with the oldest offered version so legacy peers can read the Initial.
+    auto originalVersion = supportedVersions(state->config.versions).back();
+    auto version = originalVersion;
+    while (true) {
+        ILIAS_CO_TRY(auto connection, quic::makeConnection(state, remote, serverName, nullptr, version, originalVersion));
+        ScopeExit cleanup{[&]() { connection->close(abandonedError); }};
+        state->wake.set();
+        while (!connection->handshake && !connection->error) {
+            co_await waitChanged(connection->changed);
         }
-    }};
-    state->wake.set();
-    while (!connection->handshake && !connection->error) {
-        co_await waitChanged(connection->changed);
+        if (!connection->error) {
+            cleanup.disarm();
+            co_return QuicConnection{std::move(connection)};
+        }
+        if (state->stopped) co_return Err(state->error);
+        if (version != originalVersion || !connection->retryVersion ||
+            connection->error != transportError(NGTCP2_ERR_RECV_VERSION_NEGOTIATION)) {
+            co_return Err(connection->error);
+        }
+        version = connection->retryVersion;
     }
-    if (connection->error) {
-        co_return Err(connection->error);
-    }
-    completed = true;
-    co_return QuicConnection{std::move(connection)};
 }
 
 auto QuicContext::accept() -> IoTask<QuicConnection> {
@@ -1358,8 +1610,71 @@ auto QuicConnection::close(uint64_t appError) -> IoTask<void> {
     co_return {};
 }
 
+auto QuicConnection::migrate(IPEndpoint local) -> IoTask<void> {
+    using quic::ClientPath;
+    using quic::Migration;
+    auto state = mState;
+    if (!state) co_return Err(std::make_error_code(std::errc::bad_file_descriptor));
+    if (state->server) co_return Err(std::make_error_code(std::errc::operation_not_supported));
+    if (!local.isValid()) co_return Err(std::make_error_code(std::errc::invalid_argument));
+    co_await ilias::this_coro::stopPoint();
+    while (!state->confirmed && !state->error) co_await waitChanged(state->changed);
+    if (state->error) co_return Err(state->error);
+    if (state->migration) co_return Err(std::make_error_code(std::errc::operation_in_progress));
+    if (ngtcp2_conn_get_remote_transport_params2(state->conn)->disable_active_migration) {
+        co_return Err(std::make_error_code(std::errc::operation_not_supported));
+    }
+    if (local.port() && local == state->localEndpoint()) co_return {};
+
+    auto owner = state->context.lock();
+    if (!owner || owner->stopped) co_return Err(make_error_code(QuicError::ConnectionClosed));
+    auto remote = forFamily(state->remoteEndpoint(), local.family());
+    if (remote.family() != local.family()) {
+        co_return Err(std::make_error_code(std::errc::address_family_not_supported));
+    }
+    auto socket = owner->socket;
+    if (local != socket->local) {
+        ILIAS_CO_TRY(socket, quic::bindSocket(*owner, local));
+    }
+    auto migration = std::make_shared<Migration>();
+    migration->path = std::make_unique<ClientPath>();
+    migration->path->socket = socket;
+    if (socket != owner->socket) {
+        migration->path->receiver = owner->pathReceivers.spawn(quic::receiveClientPath(owner, socket, state));
+    }
+    ngtcp2_path path{
+        .local = address(socket->local),
+        .remote = address(remote),
+    };
+    auto rv = ngtcp2_conn_initiate_migration(state->conn, &path, timestamp());
+    if (rv != 0) {
+        if (ngtcp2_err_is_fatal(rv)) {
+            state->handleError(rv);
+            state->notify();
+            state->wake();
+        }
+        co_return Err(transportError(rv));
+    }
+    state->migration = migration;
+    // ngtcp2 can switch immediately if it already validated this path.
+    if (state->localEndpoint() == socket->local) state->finishMigration({});
+    state->retryAt = state->retryUntil = 0;
+    state->wake();
+    while (!migration->result) co_await waitChanged(state->changed);
+    if (*migration->result) co_return Err(*migration->result);
+    co_return {};
+}
+
+auto QuicConnection::localEndpoint() const -> IPEndpoint {
+    return mState ? mState->localEndpoint() : IPEndpoint{};
+}
+
 auto QuicConnection::remoteEndpoint() const -> IPEndpoint {
-    return mState ? mState->remote : IPEndpoint{};
+    return mState ? mState->remoteEndpoint() : IPEndpoint{};
+}
+
+auto QuicConnection::version() const noexcept -> uint32_t {
+    return mState ? ngtcp2_conn_get_negotiated_version2(mState->conn) : 0;
 }
 
 auto QuicConnection::appError() const noexcept -> std::optional<uint64_t> {
@@ -1465,7 +1780,7 @@ auto QuicStream::flush() -> IoTask<void> {
         if (state->writeError) {
             co_return Err(state->writeError);
         }
-        if (state->sent == state->accepted) {
+        if (state->sent == state->accepted && !state->lostThrough) {
             co_return {};
         }
         co_await waitChanged(state->changed);
@@ -1485,7 +1800,7 @@ auto QuicStream::shutdown() -> IoTask<void> {
     if (auto connection = state->connection.lock()) {
         connection->wake();
     }
-    while (!state->finSent) {
+    while (!state->finSent || state->lostThrough) {
         if (state->writeError) {
             co_return Err(state->writeError);
         }

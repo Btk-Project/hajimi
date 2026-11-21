@@ -454,13 +454,13 @@ auto ClientSession::pingWorker() -> IoTask<void> {
     while (true) {
         // Send ping and measure latency
         mLastPingSent = std::chrono::steady_clock::now();
-        auto _ = co_await mConn.writeMessage(Ping{});
-        auto pong = co_await ilias::timeout(mPongArrive.wait(), 10s);
+        ILIAS_CO_TRYV(co_await mConn.writeMessage(Ping{}));
+        auto pong = co_await ilias::timeout(mPongArrive.wait(), 90s);
         if (!pong) {
             std::println("[ProxyServer] Client '{}' pong timeout, disconnect", mName);
             co_return {};
         }
-        co_await ilias::sleep(10s); // Leave room before QUIC's 30s idle timeout.
+        co_await ilias::sleep(30s);
     }
 }
 
